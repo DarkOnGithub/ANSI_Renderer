@@ -55,3 +55,7 @@ python main.py -s -r x,y,width,height -f 30
 _*If neither `-v` nor `-s` is specified, the first positional argument is treated as the video path._
 
 ---
+
+
+## Example
+[Video example](https://www.youtube.com/watch?v=o4uEzqp0cCo)
