@@ -2,7 +2,7 @@
 
 A GPU-accelerated, terminal-based video player and screen recorder that renders output using ANSI escape sequences.
 
-> ⚠️ Requires an **NVIDIA GPU** for hardware acceleration.
+> ⚠️ Requires an **NVIDIA GPU** because of hardware acceleration.
 
 ---
 
