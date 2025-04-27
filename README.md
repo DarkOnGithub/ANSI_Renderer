@@ -59,4 +59,4 @@ _*If neither `-v` nor `-s` is specified, the first positional argument is treate
 
 ## Example
 [Video example](https://www.youtube.com/watch?v=o4uEzqp0cCo)  
-[Video example 2 at 1080p](https://www.youtube.com/watch?v=o4uEzqp0cCo)
+[Video example 2 at 1080p](https://www.youtube.com/watch?v=Bs1Syhz57s8)
