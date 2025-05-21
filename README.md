@@ -3,7 +3,7 @@
 A GPU-accelerated, terminal-based video player and screen recorder that renders output using ANSI escape sequences.  
 Recommended to run on GPU accelerated terminals such as Alacritty  
 > ⚠️ Requires an **NVIDIA GPU** because of hardware acceleration.
-
+![](example.gif)
 ---
 
 ## Installation
