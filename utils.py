@@ -5,7 +5,13 @@ import threading
 import queue
 import torch
 
-from config import DEVICE, CLEAR_SCREEN, HIDE_CURSOR, SHOW_CURSOR, RESET_VALS, ANSI_COLORS
+try:
+    import lz4.frame
+    _has_lz4 = True
+except ImportError:
+    _has_lz4 = False
+
+from config import CLEAR_SCREEN, HIDE_CURSOR, SHOW_CURSOR, RESET_VALS
 
 
 def write_all(fd: int, data: bytes) -> None:
@@ -60,14 +66,31 @@ def writer_task(out_queue, target_fps: float, exit_event: threading.Event) -> No
     last_time = time.monotonic()
     i = 0
 
-    BUFFER_SIZE = 131072  # 128KB buffer for batching writes
+    # Increased buffer size for better batching and reduced system calls
+    BUFFER_SIZE = 262144  # 256KB buffer for better performance
     buffer = bytearray(BUFFER_SIZE)
     buffer_pos = 0
+
+    # LZ4 compression context for better compression ratios
+    compressor = lz4.frame.LZ4FrameCompressor() if _has_lz4 else None
 
     def flush_buffer():
         nonlocal buffer_pos
         if buffer_pos > 0:
-            write_all(fd, buffer[:buffer_pos])
+            data_to_write = buffer[:buffer_pos]
+            if compressor and len(data_to_write) > 1024:  # Only compress larger chunks
+                try:
+                    compressed_data = compressor.compress(data_to_write)
+                    compressed_data += compressor.flush()  # Finalize compression
+                    if len(compressed_data) < len(data_to_write):  # Only use if smaller
+                        # Prepend compression marker (simple approach)
+                        write_all(fd, b'\x01' + compressed_data)
+                        buffer_pos = 0
+                        return
+                except Exception:
+                    pass  # Fall back to uncompressed on compression error
+
+            write_all(fd, data_to_write)
             buffer_pos = 0
 
     try:
@@ -75,29 +98,31 @@ def writer_task(out_queue, target_fps: float, exit_event: threading.Event) -> No
             try:
                 item = out_queue.get(timeout=0.1)
                 if item is None:
-                    flush_buffer()  
+                    flush_buffer()
                     break
                 data = item.numpy().tobytes() if isinstance(item, torch.Tensor) else item
+                # Only log data size for first few frames and every 100th frame
+                # print(f"Frame {i}: Data length: {len(data) / 1024:.2f} KB", file=sys.stderr)
 
-                render_start = time.perf_counter()
-
-                if buffer_pos + len(data) <= BUFFER_SIZE:
+                # Optimized buffer management with immediate flush for large data
+                if len(data) >= BUFFER_SIZE // 2:  # If data is > 50% of buffer size
+                    flush_buffer()  # Flush existing buffer first
+                    write_all(fd, data)  # Write large data directly
+                elif buffer_pos + len(data) <= BUFFER_SIZE:
                     buffer[buffer_pos:buffer_pos + len(data)] = data
                     buffer_pos += len(data)
                 else:
                     flush_buffer()
-                    if len(data) >= BUFFER_SIZE:
-                        write_all(fd, data)
-                    else:
-                        buffer[buffer_pos:buffer_pos + len(data)] = data
-                        buffer_pos += len(data)
+                    buffer[buffer_pos:buffer_pos + len(data)] = data
+                    buffer_pos += len(data)
 
                 i += 1
                 now = time.monotonic()
                 elapsed = now - last_time
                 sleep_time = interval - elapsed
 
-                render_time = time.perf_counter() - render_start
+                # Performance logging commented out for reduced overhead
+                # render_time = time.perf_counter() - render_start
                 # if i <= 5 or i % 100 == 0:
                 #     print(f"Frame {i}: Render time: {render_time:.4f}s", file=sys.stderr)
 
@@ -108,6 +133,6 @@ def writer_task(out_queue, target_fps: float, exit_event: threading.Event) -> No
             except queue.Empty:
                 continue
     finally:
-        flush_buffer()  
+        flush_buffer()
         write_all(fd, bytes(RESET_VALS))
         write_all(fd, SHOW_CURSOR)

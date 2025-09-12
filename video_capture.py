@@ -3,7 +3,7 @@ import threading
 import torch
 
 from config import Config, _has_dxcam, _has_pynvcodec, dxcam, nvc
-from video_processing import nv12_to_rgb, resize_with_aspect_ratio
+from video_processing import nv12_to_rgb, resize
 from typing import Generator, Optional, Tuple
 
 
@@ -24,7 +24,7 @@ def read_video_from_screen(cfg: Config, stream: torch.cuda.Stream, region: Optio
                 continue
             with torch.cuda.stream(stream):
                 rgb_captured = torch.from_numpy(frame).to(cfg.device)
-                rgb_resized = resize_with_aspect_ratio(rgb_captured, cfg.height, cfg.width)
+                rgb_resized = resize(rgb_captured, cfg.height, cfg.width)
                 yield rgb_resized
 
     finally:
@@ -51,5 +51,5 @@ def read_video_from_file(filename: str, cfg: Config, stream: torch.cuda.Stream, 
                 frame_w = nv12_tensor.shape[1]
                 frame_h = int(frame_h_nv12 * 2 / 3)
                 rgb_full = nv12_to_rgb(nv12_tensor, frame_w, frame_h)
-                rgb_resized = resize_with_aspect_ratio(rgb_full, cfg.height, cfg.width)
+                rgb_resized = resize(rgb_full, cfg.height, cfg.width)
                 yield rgb_resized
