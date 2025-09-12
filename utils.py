@@ -12,7 +12,6 @@ def write_all(fd: int, data: bytes) -> None:
     """Write all data to fd, handling partial writes efficiently."""
     if not data:
         return
-
     BUFFER_SIZE = 65536  
     view = memoryview(data)
     total = 0
@@ -99,8 +98,8 @@ def writer_task(out_queue, target_fps: float, exit_event: threading.Event) -> No
                 sleep_time = interval - elapsed
 
                 render_time = time.perf_counter() - render_start
-                if i <= 5 or i % 100 == 0:
-                    print(f"Frame {i}: Render time: {render_time:.4f}s", file=sys.stderr)
+                # if i <= 5 or i % 100 == 0:
+                #     print(f"Frame {i}: Render time: {render_time:.4f}s", file=sys.stderr)
 
                 if sleep_time > 0:
                     flush_buffer()

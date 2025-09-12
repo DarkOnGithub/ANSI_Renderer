@@ -65,8 +65,8 @@ def frame_producer(path: Optional[str], capture_screen: bool, cfg: Config,
             out_queue.put(ansi.cpu())
             i += 1
 
-            if i <= 5 or i % 100 == 0:
-                print(f"Frame {i}: Processing time: {processing_time:.4f}s", file=sys.stderr)
+            # if i <= 5 or i % 100 == 0:
+            #     print(f"Frame {i}: Processing time: {processing_time:.4f}s", file=sys.stderr)
             if exit_event.is_set():
                 break
     except Exception as e:

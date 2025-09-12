@@ -55,6 +55,18 @@ def process_frame(prev_gray: Optional[torch.Tensor], rgb: torch.Tensor, diff_thr
     xs = xs.contiguous()
 
     colors_rgb = rgb[ys, xs].contiguous()
+
+    # Adaptive color quantization to reduce palette size and improve compression
+    if colors_rgb.numel() > 1000:  # Large frames - more aggressive quantization
+        QUANTIZE_LEVEL = 4  # Every 4th value (64 values per component)
+    elif colors_rgb.numel() > 100:  # Medium frames
+        QUANTIZE_LEVEL = 3  # Every 3rd value (86 values per component)
+    else:  # Small frames - less aggressive
+        QUANTIZE_LEVEL = 2  # Every 2nd value (128 values per component)
+
+    colors_rgb = (colors_rgb.float() / QUANTIZE_LEVEL).round_() * QUANTIZE_LEVEL
+    colors_rgb = colors_rgb.clamp_(0, 255).to(torch.uint8)
+
     if color_mode == '256':
         colors_quantized = quantize_colors(colors_rgb, ANSI_COLORS().to(colors_rgb.device))
         return xs, ys, colors_quantized, gray

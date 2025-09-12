@@ -183,8 +183,9 @@ def ansi_generate_256(xs: torch.Tensor, ys: torch.Tensor, color_indices: torch.T
         return torch.tensor(RESET_VALS, dtype=torch.uint8, device=cfg.device)
 
     device = cfg.device
-    key = ys * cfg.width + xs
-    sort_idx = torch.argsort(key)
+    # Sort by color first for better grouping, then by position for spatial locality
+    color_key = color_indices.to(torch.int64) * (cfg.width * cfg.height + 1) + (ys * cfg.width + xs)
+    sort_idx = torch.argsort(color_key)
     xs_sorted = xs[sort_idx]
     ys_sorted = ys[sort_idx]
     color_indices_sorted = color_indices[sort_idx]
@@ -248,12 +249,14 @@ def ansi_generate_256(xs: torch.Tensor, ys: torch.Tensor, color_indices: torch.T
     return out_buffer
 
 
+
 @torch.compile
 def ansi_generate(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, byte_vals: torch.Tensor, byte_lens: torch.Tensor, cfg: Config, current_pos: Optional[tuple[int, int]] = None, color_mode: str = 'full') -> tuple[torch.Tensor, tuple[int, int]]:
     if color_mode == '256':
-        return ansi_generate_256(xs, ys, colors, byte_vals, byte_lens, cfg), current_pos or (0, 0)
+        result, new_pos = ansi_generate_256(xs, ys, colors, byte_vals, byte_lens, cfg), current_pos or (0, 0)
     else:
-        return ansi_generate_rgb(xs, ys, colors, byte_vals, byte_lens, cfg), current_pos or (0, 0)
+        result, new_pos = ansi_generate_rgb(xs, ys, colors, byte_vals, byte_lens, cfg), current_pos or (0, 0)
+    return result, new_pos
 
 
 @torch.compile
@@ -263,8 +266,8 @@ def ansi_generate_rgb(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, 
         return torch.tensor(RESET_VALS, dtype=torch.uint8, device=cfg.device)
 
     device = cfg.device
-    key = ys * cfg.width + xs
-    sort_idx = torch.argsort(key)
+    rgb_packed = (colors[:, 0].to(torch.int64) << 24) | (colors[:, 1].to(torch.int64) << 16) | (colors[:, 2].to(torch.int64) << 8) | ((ys * cfg.width + xs) // (cfg.width * cfg.height // 256 + 1))
+    sort_idx = torch.argsort(rgb_packed)
     xs_sorted = xs[sort_idx]
     ys_sorted = ys[sort_idx]
     colors_sorted = colors[sort_idx]
