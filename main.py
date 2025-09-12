@@ -44,7 +44,6 @@ def frame_producer(path: Optional[str], capture_screen: bool, cfg: Config,
     current_cursor_pos = (0, 0)
     stream = torch.cuda.Stream(device=cfg.device)
 
-    # Memory optimization: pre-allocate commonly used tensors
     prev_gray = None
     skipped_frames = 0
     max_skip_frames = 3  # Skip up to 3 identical frames
@@ -60,7 +59,6 @@ def frame_producer(path: Optional[str], capture_screen: bool, cfg: Config,
         else:
             source = read_video_from_screen(cfg, stream, region, fps, exit_event)
         i = 0
-        # Prefetch next frame for parallel processing
         rgb_iter = iter(source)
         try:
             rgb = next(rgb_iter)
@@ -72,13 +70,10 @@ def frame_producer(path: Optional[str], capture_screen: bool, cfg: Config,
             if exit_event.is_set():
                 break
 
-            # Convert to grayscale for frame comparison (before full processing)
             current_gray = (0.299*rgb[...,0] + 0.587*rgb[...,1] + 0.114*rgb[...,2]).round_().to(torch.uint8)
 
-            # Frame skipping logic for very similar frames
             should_skip = False
             if prev_gray is not None and skipped_frames < max_skip_frames:
-                # Calculate frame similarity
                 diff = (current_gray - prev_gray).abs()
                 similarity = 1.0 - (diff.float().mean() / 255.0)
                 if similarity > frame_similarity_threshold:
@@ -88,13 +83,11 @@ def frame_producer(path: Optional[str], capture_screen: bool, cfg: Config,
                     skipped_frames = 0
 
             if should_skip:
-                # Send empty frame to maintain timing
                 empty_ansi = torch.tensor(RESET_VALS, dtype=torch.uint8, device=cfg.device)
                 out_queue.put(empty_ansi.cpu())
-                prev_gray = current_gray  # Update prev_gray for next comparison
+                prev_gray = current_gray 
                 i += 1
 
-                # Advance to next frame with prefetching
                 rgb = next_rgb
                 try:
                     next_rgb = next(rgb_iter)
@@ -105,14 +98,10 @@ def frame_producer(path: Optional[str], capture_screen: bool, cfg: Config,
                     break
                 continue
 
-            # Adaptive diff threshold calculation
             current_diff_thresh = base_diff_thresh
             if adaptive_diff_enabled and prev_gray is not None:
-                # Calculate frame complexity (variance) to adjust threshold
                 if prev_gray.numel() > 0:
                     variance = torch.var(prev_gray.float())
-                    # Higher variance = more detail = lower threshold for better quality
-                    # Lower variance = less detail = higher threshold for more compression
                     complexity_factor = min(1.0, variance / 1000.0)  # Normalize variance
                     current_diff_thresh = int(base_diff_thresh * (0.5 + complexity_factor))
 
@@ -121,19 +110,16 @@ def frame_producer(path: Optional[str], capture_screen: bool, cfg: Config,
                 xs, ys, cols, gray = process_frame(prev_gray, rgb, current_diff_thresh, color_mode)
                 prev_gray = gray
                 ansi, current_cursor_pos = ansi_generate(xs, ys, cols, lookup_vals, lookup_lens, cfg, current_cursor_pos, color_mode)
-                # Move to CPU asynchronously to overlap with next frame processing
                 ansi_cpu = ansi.cpu()
             stream.synchronize()
             processing_time = time.perf_counter() - processing_start
 
             out_queue.put(ansi_cpu)
-            skipped_frames = 0  # Reset skip counter on successful frame
+            skipped_frames = 0 
             i += 1
 
-            # if i <= 5 or i % 100 == 0:
             # print(f"Frame {i}: Processing time: {processing_time:.4f}s; fps: {1/processing_time:.2f}", file=sys.stderr)
 
-            # Advance to next frame with prefetching
             rgb = next_rgb
             try:
                 next_rgb = next(rgb_iter)
@@ -168,7 +154,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cols, rows = os.get_terminal_size() if sys.stdout.isatty() else (80, 24)
-    cols, rows = 1280, 720
+    # cols, rows = 1280, 720
     # cols, rows = 1920, 1080
     cfg = Config(width=cols-1, height=rows-1, device=DEVICE,
                  gpu_id=args.gpu_id, diff_thresh=args.diff_thresh)
@@ -182,11 +168,9 @@ def main() -> None:
     lookup_vals, lookup_lens = setup_lookup(max(cfg.width+1, cfg.height+1, 256), DEVICE)
     out_q = queue.Queue(maxsize=max(1, args.queue_size))
 
-    # Memory optimization: pre-allocate CUDA stream and enable memory pooling
-    torch.cuda.set_per_process_memory_fraction(0.8)  # Reserve some memory for system
-    torch.cuda.empty_cache()  # Clear any existing cache
+    torch.cuda.set_per_process_memory_fraction(0.8) 
+    torch.cuda.empty_cache()  
 
-    # Enable pinned memory for faster CPU-GPU transfers
     if torch.cuda.is_available():
         torch.cuda.set_device(cfg.gpu_id)
 

@@ -66,29 +66,26 @@ def writer_task(out_queue, target_fps: float, exit_event: threading.Event) -> No
     last_time = time.monotonic()
     i = 0
 
-    # Increased buffer size for better batching and reduced system calls
-    BUFFER_SIZE = 262144  # 256KB buffer for better performance
+    BUFFER_SIZE = 262144  
     buffer = bytearray(BUFFER_SIZE)
     buffer_pos = 0
 
-    # LZ4 compression context for better compression ratios
     compressor = lz4.frame.LZ4FrameCompressor() if _has_lz4 else None
 
     def flush_buffer():
         nonlocal buffer_pos
         if buffer_pos > 0:
             data_to_write = buffer[:buffer_pos]
-            if compressor and len(data_to_write) > 1024:  # Only compress larger chunks
+            if compressor and len(data_to_write) > 1024:  
                 try:
                     compressed_data = compressor.compress(data_to_write)
-                    compressed_data += compressor.flush()  # Finalize compression
-                    if len(compressed_data) < len(data_to_write):  # Only use if smaller
-                        # Prepend compression marker (simple approach)
+                    compressed_data += compressor.flush()  
+                    if len(compressed_data) < len(data_to_write):  
                         write_all(fd, b'\x01' + compressed_data)
                         buffer_pos = 0
                         return
                 except Exception:
-                    pass  # Fall back to uncompressed on compression error
+                    pass  
 
             write_all(fd, data_to_write)
             buffer_pos = 0
@@ -101,13 +98,11 @@ def writer_task(out_queue, target_fps: float, exit_event: threading.Event) -> No
                     flush_buffer()
                     break
                 data = item.numpy().tobytes() if isinstance(item, torch.Tensor) else item
-                # Only log data size for first few frames and every 100th frame
                 # print(f"Frame {i}: Data length: {len(data) / 1024:.2f} KB", file=sys.stderr)
 
-                # Optimized buffer management with immediate flush for large data
-                if len(data) >= BUFFER_SIZE // 2:  # If data is > 50% of buffer size
-                    flush_buffer()  # Flush existing buffer first
-                    write_all(fd, data)  # Write large data directly
+                if len(data) >= BUFFER_SIZE // 2:  
+                    flush_buffer() 
+                    write_all(fd, data) 
                 elif buffer_pos + len(data) <= BUFFER_SIZE:
                     buffer[buffer_pos:buffer_pos + len(data)] = data
                     buffer_pos += len(data)
@@ -121,7 +116,6 @@ def writer_task(out_queue, target_fps: float, exit_event: threading.Event) -> No
                 elapsed = now - last_time
                 sleep_time = interval - elapsed
 
-                # Performance logging commented out for reduced overhead
                 # render_time = time.perf_counter() - render_start
                 # if i <= 5 or i % 100 == 0:
                 #     print(f"Frame {i}: Render time: {render_time:.4f}s", file=sys.stderr)

@@ -13,11 +13,6 @@ def compress_frame_data(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor
     if xs.numel() == 0:
         return xs, ys, colors
 
-    # Remove isolated pixels that are likely noise (single pixels surrounded by different colors)
-    if xs.numel() > 10:  # Only for frames with enough data
-        # This is a simplified noise reduction - in practice you'd want more sophisticated filtering
-        # For now, just ensure we have reasonable data density
-        pass
 
     return xs, ys, colors
 
@@ -199,7 +194,6 @@ def ansi_generate_256(xs: torch.Tensor, ys: torch.Tensor, color_indices: torch.T
         return torch.tensor(RESET_VALS, dtype=torch.uint8, device=cfg.device)
 
     device = cfg.device
-    # Optimized spatial + color sorting for maximum compression
     spatial_key = ys.to(torch.int64) * cfg.width + xs.to(torch.int64)
     color_key = color_indices.to(torch.int64) * (cfg.width * cfg.height + 1)
     sort_key = spatial_key + color_key
@@ -212,10 +206,8 @@ def ansi_generate_256(xs: torch.Tensor, ys: torch.Tensor, color_indices: torch.T
     x_diff = xs_sorted[1:] - xs_sorted[:-1]
     color_diff = color_indices_sorted[1:] != color_indices_sorted[:-1]
 
-    # More aggressive run-length encoding for 256-color mode
     is_new_run = torch.zeros(N, dtype=torch.bool, device=device)
     is_new_run[0] = True
-    # Allow gaps of 2 pixels for better compression in 256-color mode too
     is_new_run[1:] = y_diff | ((~y_diff) & ((x_diff > 2) | color_diff))
     run_start_indices = torch.where(is_new_run)[0]
     run_lengths = torch.diff(run_start_indices, append=torch.tensor([N], device=device))
@@ -273,13 +265,10 @@ def ansi_generate_256(xs: torch.Tensor, ys: torch.Tensor, color_indices: torch.T
 
 @torch.compile
 def ansi_generate(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, byte_vals: torch.Tensor, byte_lens: torch.Tensor, cfg: Config, current_pos: Optional[tuple[int, int]] = None, color_mode: str = 'full') -> tuple[torch.Tensor, tuple[int, int]]:
-    # Apply compression before ANSI generation
-    xs_compressed, ys_compressed, colors_compressed = compress_frame_data(xs, ys, colors, cfg, color_mode)
-
     if color_mode == '256':
-        result, new_pos = ansi_generate_256(xs_compressed, ys_compressed, colors_compressed, byte_vals, byte_lens, cfg), current_pos or (0, 0)
+        result, new_pos = ansi_generate_256(xs, ys, colors, byte_vals, byte_lens, cfg), current_pos or (0, 0)
     else:
-        result, new_pos = ansi_generate_rgb(xs_compressed, ys_compressed, colors_compressed, byte_vals, byte_lens, cfg), current_pos or (0, 0)
+        result, new_pos = ansi_generate_rgb(xs, ys, colors, byte_vals, byte_lens, cfg), current_pos or (0, 0)
     return result, new_pos
 
 
@@ -290,8 +279,6 @@ def ansi_generate_rgb(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, 
         return torch.tensor(RESET_VALS, dtype=torch.uint8, device=cfg.device)
 
     device = cfg.device
-    # More efficient spatial + color sorting for better compression
-    # Group by row first, then by color proximity for optimal run-length encoding
     spatial_key = ys.to(torch.int64) * cfg.width + xs.to(torch.int64)
     color_key = (colors[:, 0].to(torch.int64) << 16) | (colors[:, 1].to(torch.int64) << 8) | colors[:, 2].to(torch.int64)
     sort_key = spatial_key + color_key * (cfg.width * cfg.height + 1)
@@ -304,10 +291,8 @@ def ansi_generate_rgb(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, 
     x_diff = xs_sorted[1:] - xs_sorted[:-1]
     color_diff = (colors_sorted[1:] != colors_sorted[:-1]).any(dim=1)
 
-    # More aggressive run-length encoding: allow gaps of 2 pixels for better compression
     is_new_run = torch.zeros(N, dtype=torch.bool, device=device)
     is_new_run[0] = True
-    # Start new run if: different row OR (same row AND (gap > 2 pixels OR different color))
     is_new_run[1:] = y_diff | ((~y_diff) & ((x_diff > 2) | color_diff))
     run_start_indices = torch.where(is_new_run)[0]
     run_lengths = torch.diff(run_start_indices, append=torch.tensor([N], device=device))
@@ -342,9 +327,8 @@ def ansi_generate_rgb(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, 
 
     LOOKUP_MAX_LEN = byte_vals.size(1)
     grid = (num_runs,)
-    # Optimize kernel launch parameters for better performance
-    block_size = min(LOOKUP_MAX_LEN, 64)  # Adaptive block size
-    num_warps = min(8, max(1, num_runs // 32))  # Adaptive warp count
+    block_size = min(LOOKUP_MAX_LEN, 64)  
+    num_warps = min(8, max(1, num_runs // 32)) 
 
     ansi_run_kernel[grid](
         run_xs, run_ys,
