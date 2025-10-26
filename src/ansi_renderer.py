@@ -26,7 +26,7 @@ class AnsiRenderer:
         if not frame:
             return
 
-        BUFFER_SIZE = 65536 * 10
+        BUFFER_SIZE = 65536 
         view = memoryview(frame)
         fd = self.config.output_fd
 

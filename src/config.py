@@ -31,5 +31,5 @@ class Config:
     width: int
     height: int
     device: torch.device
-    diff_thresh: int = 0  #
+    diff_thresh: int = 0 
     output_fd: int = sys.stdout.fileno()

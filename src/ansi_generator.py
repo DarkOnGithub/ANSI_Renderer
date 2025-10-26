@@ -129,7 +129,7 @@ def ansi_generate_rgb(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, 
 
     is_new_run = torch.zeros(N, dtype=torch.bool, device=device)
     is_new_run[0] = True
-    is_new_run[1:] = y_diff | ((~y_diff) & ((x_diff > 2) | color_diff))
+    is_new_run[1:] = y_diff | (x_diff != 1) | color_diff
     run_start_indices = torch.where(is_new_run)[0]
     run_lengths = torch.diff(run_start_indices, append=torch.tensor([N], device=device))
 
