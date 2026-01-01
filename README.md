@@ -1,10 +1,16 @@
 # ANSI Renderer
 
 A GPU-accelerated, terminal-based video player and screen recorder that renders output using ANSI escape sequences.  
+Capable of rendering at **1080p**, though some stuttering may still occur depending on terminal performance and hardware.  
 Recommended to run on GPU accelerated terminals such as Alacritty  
 > ⚠️ Requires an **NVIDIA GPU** because of hardware acceleration.
-![](example.gif)
 ---
+
+## Examples
+
+[![Project Demo](demo1.gif)](https://youtu.be/eTm7I9le77I)
+[![Project Demo](demo2.gif)](https://youtu.be/Exscan4-mHE)
+[![Project Demo](demo3.gif)](https://youtu.be/DE2veokYNXE)
 
 ## Installation
 
@@ -56,7 +62,3 @@ _*If neither `-v` nor `-s` is specified, the first positional argument is treate
 
 ---
 
-
-## Example
-[Video example](https://www.youtube.com/watch?v=o4uEzqp0cCo)  
-[Video example 2 at 1080p](https://www.youtube.com/watch?v=Bs1Syhz57s8)

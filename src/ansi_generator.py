@@ -1,13 +1,14 @@
 import torch
 import triton
 import triton.language as tl
-from config import Config, ESC_VALS, SEP_VAL, CUR_END_VAL, COL_PREF_VALS, RESET_VALS
+from .config import Config, ESC_VALS, SEP_VAL, CUR_END_VAL, COL_PREF_VALS, RESET_VALS
 
 @triton.jit
 def ansi_run_kernel(
     run_xs_ptr, run_ys_ptr,
     run_r_ptr, run_g_ptr, run_b_ptr,
     run_lengths_ptr, offsets_ptr,
+    needs_move_ptr,
     row_lookup_bytes_ptr, row_lookup_lens_ptr,
     col_lookup_bytes_ptr, col_lookup_lens_ptr,
     r_lookup_bytes_ptr, r_lookup_lens_ptr,
@@ -36,33 +37,35 @@ def ansi_run_kernel(
     b_val = tl.load(run_b_ptr + pid)
     length = tl.load(run_lengths_ptr + pid)
     offset = tl.load(offsets_ptr + pid)
+    needs_move = tl.load(needs_move_ptr + pid)
 
     ptr = out_ptr + offset
 
-    tl.store(ptr, ESC0)
-    ptr += 1
-    tl.store(ptr, ESC1)
-    ptr += 1
-    row_idx = y + 1
-    row_len = tl.load(row_lookup_lens_ptr + row_idx)
-    row_bytes_base = row_lookup_bytes_ptr + row_idx * BLOCK_SIZE
-    for i in tl.static_range(BLOCK_SIZE):
-        if i < row_len:
-            byte = tl.load(row_bytes_base + i)
-            tl.store(ptr + i, byte)
-    ptr += row_len
-    tl.store(ptr, SEP)
-    ptr += 1
-    col_idx = x_start + 1
-    col_len = tl.load(col_lookup_lens_ptr + col_idx)
-    col_bytes_base = col_lookup_bytes_ptr + col_idx * BLOCK_SIZE
-    for i in tl.static_range(BLOCK_SIZE):
-        if i < col_len:
-            byte = tl.load(col_bytes_base + i)
-            tl.store(ptr + i, byte)
-    ptr += col_len
-    tl.store(ptr, CUR_END)
-    ptr += 1
+    if needs_move:
+        tl.store(ptr, ESC0)
+        ptr += 1
+        tl.store(ptr, ESC1)
+        ptr += 1
+        row_idx = y + 1
+        row_len = tl.load(row_lookup_lens_ptr + row_idx)
+        row_bytes_base = row_lookup_bytes_ptr + row_idx * BLOCK_SIZE
+        for i in tl.static_range(BLOCK_SIZE):
+            if i < row_len:
+                byte = tl.load(row_bytes_base + i)
+                tl.store(ptr + i, byte)
+        ptr += row_len
+        tl.store(ptr, SEP)
+        ptr += 1
+        col_idx = x_start + 1
+        col_len = tl.load(col_lookup_lens_ptr + col_idx)
+        col_bytes_base = col_lookup_bytes_ptr + col_idx * BLOCK_SIZE
+        for i in tl.static_range(BLOCK_SIZE):
+            if i < col_len:
+                byte = tl.load(col_bytes_base + i)
+                tl.store(ptr + i, byte)
+        ptr += col_len
+        tl.store(ptr, CUR_END)
+        ptr += 1
 
     tl.store(ptr + 0, COL_PREF0)
     tl.store(ptr + 1, COL_PREF1)
@@ -100,9 +103,11 @@ def ansi_run_kernel(
     ptr += b_len
     tl.store(ptr, 109)
     ptr += 1
-    for i in range(length):
-        tl.store(ptr, SPACE)
-        ptr += 1
+    
+    for i in range(0, 2048, 32):
+        if i < length:
+            off = i + tl.arange(0, 32)
+            tl.store(ptr + off, SPACE, mask=off < length)
 
 def ansi_generate(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, byte_vals: torch.Tensor, byte_lens: torch.Tensor, cfg: Config) -> tuple[torch.Tensor, tuple[int, int]]:
     result = ansi_generate_rgb(xs, ys, colors, byte_vals, byte_lens, cfg)
@@ -115,10 +120,12 @@ def ansi_generate_rgb(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, 
         return torch.tensor(RESET_VALS, dtype=torch.uint8, device=cfg.device)
 
     device = cfg.device
+    
+    if not hasattr(cfg, '_ansi_out_buffer'):
+        cfg._ansi_out_buffer = torch.empty(10 * 1024 * 1024, dtype=torch.uint8, device=device)
+
     spatial_key = ys.to(torch.int64) * cfg.width + xs.to(torch.int64)
-    color_key = (colors[:, 0].to(torch.int64) << 16) | (colors[:, 1].to(torch.int64) << 8) | colors[:, 2].to(torch.int64)
-    sort_key = spatial_key + color_key * (cfg.width * cfg.height + 1)
-    sort_idx = torch.argsort(sort_key, stable=True)
+    sort_idx = torch.argsort(spatial_key)
     xs_sorted = xs[sort_idx]
     ys_sorted = ys[sort_idx]
     colors_sorted = colors[sort_idx]
@@ -139,6 +146,13 @@ def ansi_generate_rgb(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, 
 
     run_xs = xs_sorted[run_start_indices]
     run_ys = ys_sorted[run_start_indices]
+    
+    needs_move = torch.ones(num_runs, dtype=torch.bool, device=device)
+    if num_runs > 1:
+        same_row = (run_ys[1:] == run_ys[:-1])
+        continuous_x = (run_xs[1:] == (run_xs[:-1] + run_lengths[:-1]))
+        needs_move[1:] = ~(same_row & continuous_x)
+
     run_colors = colors_sorted[run_start_indices]
     run_r = run_colors[:, 0].contiguous()
     run_g = run_colors[:, 1].contiguous()
@@ -153,25 +167,39 @@ def ansi_generate_rgb(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, 
     r_lens = byte_lens[r_idx]
     g_lens = byte_lens[g_idx]
     b_lens = byte_lens[b_idx]
-    cursor_part = 3 + row_lens + 1 + col_lens + 1
-    color_part = 7 + r_lens + 1 + g_lens + 1 + b_lens
+    
+    cursor_part = torch.where(needs_move, 2 + row_lens + 1 + col_lens + 1, torch.zeros(num_runs, dtype=torch.int64, device=device))
+    color_part = 7 + r_lens + 1 + g_lens + 1 + b_lens + 1
     total_lens = cursor_part + color_part + run_lengths
 
+    total_len_all = total_lens.sum()
     offsets = torch.cat((torch.zeros(1, dtype=torch.int64, device=device), total_lens.cumsum(dim=0)[:-1]), dim=0)
     reset_len = len(RESET_VALS)
-    out_buffer = torch.empty(total_lens.sum() + reset_len, dtype=torch.uint8, device=device)
+    
+    total_size_needed_val = total_len_all.item() + reset_len
+    if cfg._ansi_out_buffer.size(0) < total_size_needed_val:
+        cfg._ansi_out_buffer = torch.empty(int(total_size_needed_val * 1.2), dtype=torch.uint8, device=device)
+    
+    out_buffer = cfg._ansi_out_buffer[:total_size_needed_val]
 
     LOOKUP_MAX_LEN = byte_vals.size(1)
     grid = (num_runs,)
     block_size = min(LOOKUP_MAX_LEN, 64)
 
     num_warps_raw = min(8, max(1, num_runs // 32))
-    num_warps = 1 << (num_warps_raw - 1).bit_length() - (num_warps_raw & (num_warps_raw - 1) != 0)
+    num_warps = 1
+    if num_warps_raw >= 8:
+        num_warps = 8
+    elif num_warps_raw >= 4:
+        num_warps = 4
+    elif num_warps_raw >= 2:
+        num_warps = 2
 
     ansi_run_kernel[grid](
         run_xs, run_ys,
         run_r.to(torch.int64), run_g.to(torch.int64), run_b.to(torch.int64),
         run_lengths, offsets,
+        needs_move,
         byte_vals, byte_lens,
         byte_vals, byte_lens,
         byte_vals, byte_lens,
@@ -191,6 +219,6 @@ def ansi_generate_rgb(xs: torch.Tensor, ys: torch.Tensor, colors: torch.Tensor, 
     )
 
     reset_tensor = torch.tensor(RESET_VALS, dtype=torch.uint8, device=device)
-    out_buffer[total_lens.sum():] = reset_tensor
+    out_buffer[total_len_all.item():] = reset_tensor
 
     return out_buffer

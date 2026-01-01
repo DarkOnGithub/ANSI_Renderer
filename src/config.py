@@ -24,6 +24,8 @@ CUR_LEFT_SUFFIX = (68,)  # D
 HIDE_CURSOR = b"\033[?25l"
 SHOW_CURSOR = b"\033[?25h"
 CLEAR_SCREEN = b"\033[2J"
+ENABLE_ALT_BUFFER = b"\033[?1049h"
+DISABLE_ALT_BUFFER = b"\033[?1049l"
 CELL_ASPECT = 0.5
 
 @dataclass
@@ -31,5 +33,11 @@ class Config:
     width: int
     height: int
     device: torch.device
+    fps: float = 30.0
+    audio_path: str = None
     diff_thresh: int = 0 
     output_fd: int = sys.stdout.fileno()
+    timing_file: str = "timing.csv"
+    timing_enabled: bool = False
+    print_delay: float = 0.0
+    audio_delay: float = 0.0  

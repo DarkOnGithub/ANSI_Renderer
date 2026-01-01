@@ -3,7 +3,13 @@ from src.ansi_renderer import AnsiRenderer
 import cv2 as cv
 from src.config import Config
 
-video_path = "./test.mp4"
+video_path = "ChatGPT ｜ The Intelligence Age [kIhb5pEo_j0].mp4"
+
+def get_video_fps(path: str) -> float:
+    cap = cv.VideoCapture(path)
+    fps = cap.get(cv.CAP_PROP_FPS)
+    cap.release()
+    return fps
 
 def get_frame_generator(video_path: str):
     cap = cv.VideoCapture(video_path)
@@ -17,20 +23,23 @@ def get_frame_generator(video_path: str):
         yield frame_rgb
     cap.release()
 
-terminal_size = {
-    "columns": 854,
-    "lines": 480,
-}
-config = Config(width=terminal_size["columns"], height=terminal_size["lines"], device=torch.device('cuda'))
+fps = get_video_fps(video_path)
+config = Config(
+    width=1920, 
+    height=1080, 
+    device=torch.device('cuda'),
+    fps=fps,
+    audio_path=video_path
+)
 renderer = AnsiRenderer(frame_generator=get_frame_generator(video_path), config=config)
+
 try:
-    while True:
-        ansi = next(renderer.get_next_ansi_sequence())
-        data = ansi.cpu().numpy().tobytes() if isinstance(ansi, torch.Tensor) else ansi
-        renderer.render_frame(data)
+    for ansi, frame_idx in renderer.get_next_ansi_sequence():
+        renderer.render_frame(ansi, frame_idx)
 except KeyboardInterrupt:
     print("\nInterrupted by user. Exiting...")
 except Exception as e:
     print(f"Main thread caught exception: {e}")
-    print(f"Exception type: {type(e)}")
+    import traceback
+    traceback.print_exc()
     print("Program exiting due to thread crash")
