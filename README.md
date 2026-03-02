@@ -47,24 +47,19 @@ padding = { x = 0, y = 0 }
 
 ## Installation
 
-1) Create and activate a virtual environment
+1) Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you haven't already
+
+2) Install project dependencies
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+uv sync
 ```
 
-2) Install a CUDA-enabled PyTorch build (pick your CUDA version)
+3) Replace PyTorch with a CUDA-enabled build (pick your CUDA version)
 
 ```bash
 # example (CUDA 12.8)
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-```
-
-3) Install project dependencies
-
-```bash
-pip install -e .
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ## Run
