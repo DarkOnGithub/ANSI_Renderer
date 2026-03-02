@@ -13,6 +13,7 @@ Notes:
 
 ## Demos
 
+- [![3D Cube Demo](Cube.gif)](https://youtu.be/7Zr2gqd8iPI)
 - Yaosobi - Idol: https://youtu.be/7995X3B275g
 - 3D Cube: https://youtu.be/7Zr2gqd8iPI
 - Bad Apple: https://youtu.be/EVdXZdDUfWs
@@ -32,17 +33,16 @@ Notes:
 Use this in your Alacritty config for a fullscreen, borderless setup tuned for 720p with `render_mode="quadrant"` and `quadrant_cell_divisor=2`:
 
 ```toml
-[window]
-startup_mode = "Fullscreen"
-padding = { x = 0, y = 0 }
-decorations = "none"
-
 [font]
-size = 3.6
+size = 3.7
 
 [font.offset]
 x = 0
-y = -2
+y = -5
+
+[window]
+startup_mode = "Fullscreen"
+padding = { x = 0, y = 0 }
 ```
 
 ## Installation
