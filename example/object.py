@@ -236,7 +236,6 @@ def main():
         timing_file="timing_object.csv",
         render_mode="quadrant",
         quadrant_cell_divisor=2,
-        color_mode="truecolor",
         diff_thresh=0,
         quant_mask=0xFF,
         run_color_diff_thresh=0,

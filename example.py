@@ -7,7 +7,9 @@ import subprocess
 import numpy as np
 from src.config import Config
 
-video_path = r"/home/user/python/ANSI_Renderer/SLAUGHTERHOUSE - FULL [UNNERFED] [7W5bZJY2IPI].mp4"
+
+
+video_path = r"...PUT YOUR VIDEO PATH HERE..."
 
 
 def open_software_capture(path: str) -> cv.VideoCapture:
@@ -135,9 +137,8 @@ config = Config(
     device=torch.device("cuda"),
     fps=fps,
     audio_path=video_path,
-    render_mode="octant",
+    render_mode="quadrant",
     quadrant_cell_divisor=2,
-    color_mode="truecolor",
     quant_mask=0xF8,
     diff_thresh=12,
     run_color_diff_thresh=12,
