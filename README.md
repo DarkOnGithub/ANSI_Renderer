@@ -47,12 +47,12 @@ startup_mode = "Fullscreen"
 padding = { x = 0, y = 0 }
 ```
 
-## Installation
+## Installation (uv)
 
-1) Create and activate a virtual environment
+1) Create a virtual environment with `uv` (activation is optional; `uv run` will auto-use `.venv`)
 
 ```bash
-python -m venv .venv
+uv venv .venv
 source .venv/bin/activate
 ```
 
@@ -60,13 +60,13 @@ source .venv/bin/activate
 
 ```bash
 # example (CUDA 12.8)
-pip install torch --index-url https://download.pytorch.org/whl/cu128
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
 3) Install project dependencies
 
 ```bash
-pip install -e .
+uv pip install -e .
 ```
 
 ## Run
@@ -76,7 +76,7 @@ pip install -e .
 Edit `video_path` in `example.py`, then run:
 
 ```bash
-python example.py
+uv run example.py
 ```
 
 This script:
@@ -87,7 +87,7 @@ This script:
 ### 3D cube demo (`example/object.py`)
 
 ```bash
-python example/object.py
+uv run example/object.py
 ```
 
 This is a procedural GPU-rendered cube scene streamed to ANSI.
@@ -97,7 +97,7 @@ This is a procedural GPU-rendered cube scene streamed to ANSI.
 If you enable timing in config (for example in `example/object.py`), analyze the CSV with:
 
 ```bash
-python analyze_timing.py timing_object.csv 1
+uv run analyze_timing.py timing_object.csv 1
 ```
 
 ## Minimal API usage
