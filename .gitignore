@@ -3,3 +3,6 @@
 .venv
 __pycache__/
 *.csv
+src/__pycache__/ansi_generator.cpython-313.pyc
+src/__pycache__/config.cpython-313.pyc
+src/__pycache__/frame_processing.cpython-313.pyc

@@ -117,31 +117,53 @@ def _encode_octant_cells(frame: torch.Tensor) -> torch.Tensor:
     luminance = (
         0.299 * cells[:, :, 0] + 0.587 * cells[:, :, 1] + 0.114 * cells[:, :, 2]
     )
-    threshold = luminance.mean(dim=1, keepdim=True)
-    fg_mask = luminance >= threshold
+    min_vals = luminance.argmin(dim=1)
+    max_vals = luminance.argmax(dim=1)
+    cell_indices = torch.arange(cells.size(0), device=device)
 
-    # Avoid degenerate all-on/all-off masks from flat rounding noise.
-    flat_cells = fg_mask.all(dim=1) | (~fg_mask).all(dim=1)
-    if flat_cells.any():
-        min_vals = luminance.argmin(dim=1)
-        max_vals = luminance.argmax(dim=1)
-        flat_idx = flat_cells.nonzero(as_tuple=False).squeeze(1)
-        fg_mask[flat_idx] = False
-        fg_mask[flat_idx, max_vals[flat_idx]] = True
-        varied_flat = (
-            luminance[flat_idx, max_vals[flat_idx]]
-            > luminance[flat_idx, min_vals[flat_idx]]
-        )
-        varied_idx = flat_idx[varied_flat]
-        if varied_idx.numel() > 0:
-            fg_mask[varied_idx, min_vals[varied_idx]] = False
+    bg_centroid = cells[cell_indices, min_vals]
+    fg_centroid = cells[cell_indices, max_vals]
 
-    fg_counts = fg_mask.sum(dim=1, keepdim=True).clamp_min(1)
-    bg_mask = ~fg_mask
-    bg_counts = bg_mask.sum(dim=1, keepdim=True).clamp_min(1)
+    cluster_mask = torch.zeros((cells.size(0), 8), dtype=torch.bool, device=device)
+    for _ in range(2):
+        fg_dist = ((cells - fg_centroid.unsqueeze(1)) ** 2).sum(dim=2)
+        bg_dist = ((cells - bg_centroid.unsqueeze(1)) ** 2).sum(dim=2)
+        cluster_mask = fg_dist <= bg_dist
 
-    fg = (cells * fg_mask.unsqueeze(-1)).sum(dim=1) / fg_counts
-    bg = (cells * bg_mask.unsqueeze(-1)).sum(dim=1) / bg_counts
+        empty_fg = ~cluster_mask.any(dim=1)
+        if empty_fg.any():
+            cluster_mask[empty_fg, max_vals[empty_fg]] = True
+
+        empty_bg = cluster_mask.all(dim=1)
+        if empty_bg.any():
+            cluster_mask[empty_bg, min_vals[empty_bg]] = False
+
+        fg_counts = cluster_mask.sum(dim=1, keepdim=True).clamp_min(1)
+        bg_mask = ~cluster_mask
+        bg_counts = bg_mask.sum(dim=1, keepdim=True).clamp_min(1)
+
+        fg_centroid = (cells * cluster_mask.unsqueeze(-1)).sum(dim=1) / fg_counts
+        bg_centroid = (cells * bg_mask.unsqueeze(-1)).sum(dim=1) / bg_counts
+
+    fg_luma = (
+        0.299 * fg_centroid[:, 0]
+        + 0.587 * fg_centroid[:, 1]
+        + 0.114 * fg_centroid[:, 2]
+    )
+    bg_luma = (
+        0.299 * bg_centroid[:, 0]
+        + 0.587 * bg_centroid[:, 1]
+        + 0.114 * bg_centroid[:, 2]
+    )
+    swap_clusters = fg_luma < bg_luma
+
+    fg_mask = cluster_mask.clone()
+    fg = fg_centroid.clone()
+    bg = bg_centroid.clone()
+    if swap_clusters.any():
+        fg_mask[swap_clusters] = ~cluster_mask[swap_clusters]
+        fg[swap_clusters] = bg_centroid[swap_clusters]
+        bg[swap_clusters] = fg_centroid[swap_clusters]
 
     bit_weights = torch.tensor(
         (1, 2, 4, 8, 16, 32, 64, 128), dtype=torch.int64, device=device
