@@ -9,7 +9,7 @@ from src.config import Config
 
 
 
-video_path = r"...PUT YOUR VIDEO PATH HERE..."
+video_path = r"(Extreme Demon) ''Tidal Wave'' by OniLinkGD ｜ Geometry Dash [YbyfDYChIYU].mp4"
 
 
 def open_software_capture(path: str) -> cv.VideoCapture:
@@ -137,32 +137,33 @@ config = Config(
     device=torch.device("cuda"),
     fps=fps,
     audio_path=video_path,
-    render_mode="quadrant",
-    quadrant_cell_divisor=2,
-    quant_mask=0xF8,
-    diff_thresh=12,
-    run_color_diff_thresh=12,
+    render_mode="octant",
+    octant_cell_width_divisor=2,
+    octant_cell_height_divisor=4,
+    quant_mask=0xFF,
+    diff_thresh=0,
+    run_color_diff_thresh=0,
     adaptive_quality=True,
-    adaptive_quant_masks=(0xF8, 0xF0, 0xE0),
-    adaptive_diff_thresh_offsets=(0, 4, 10),
-    adaptive_run_color_diff_offsets=(0, 6, 14),
-    adaptive_ema_alpha=0.15,
-    target_frame_bytes=3_000_000,
-    frame_byte_buffer_frames=8,
-    max_frame_bytes=3_500_000,
+    adaptive_quant_masks=(0xFF, 0xFE, 0xFC, 0xF8),
+    adaptive_diff_thresh_offsets=(0, 1, 2, 4),
+    adaptive_run_color_diff_offsets=(0, 1, 3, 6),
+    adaptive_ema_alpha=0.08,
+    target_frame_bytes=3_800_000,
+    frame_byte_buffer_frames=10,
+    max_frame_bytes=4_200_000,
     relative_cursor_moves=True,
     use_rep=True,
     rep_min_run=4,
     sync_output=True,
     prefer_writev=True,
     write_chunk_size=2_097_152,
-    queue_size=8,
-    buffer_pool_size=10,
-    initial_buffer_size=12 * 1024 * 1024,
+    queue_size=10,
+    buffer_pool_size=12,
+    initial_buffer_size=16 * 1024 * 1024,
     async_copy_stream=True,
     pacing_render_lead=True,
-    pacing_render_alpha=0.25,
-    timing_enabled=False,
+    pacing_render_alpha=0.18,
+    timing_enabled=True,
     timing_file="timing_object.csv",
 )
 renderer = AnsiRenderer(frame_generator=get_frame_generator(video_path), config=config)

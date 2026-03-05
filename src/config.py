@@ -91,3 +91,5 @@ class Config:
     cap_density_weight: float = 24.0
     render_mode: str = "pixel"
     quadrant_cell_divisor: int = 2
+    octant_cell_width_divisor: int = 2
+    octant_cell_height_divisor: int = 4

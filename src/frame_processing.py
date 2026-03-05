@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 import torch
 
 from .config import Config
+from .glyph_tables import OCTANT_GLYPH_SWAP
 from .utils import resize_frame_keep_aspect
 
 _QUADRANT_MASKS = (
@@ -25,6 +26,7 @@ _QUADRANT_MASKS = (
 )
 
 _quadrant_mask_cache: dict[torch.device, torch.Tensor] = {}
+_octant_swap_cache: dict[torch.device, torch.Tensor] = {}
 
 
 def _get_quadrant_masks(device: torch.device) -> torch.Tensor:
@@ -33,6 +35,16 @@ def _get_quadrant_masks(device: torch.device) -> torch.Tensor:
         masks = torch.tensor(_QUADRANT_MASKS, dtype=torch.float32, device=device)
         _quadrant_mask_cache[device] = masks
     return masks
+
+
+def _get_octant_swap_flags(device: torch.device) -> torch.Tensor:
+    swap_flags = _octant_swap_cache.get(device)
+    if swap_flags is None:
+        swap_flags = torch.tensor(
+            OCTANT_GLYPH_SWAP, dtype=torch.bool, device=device
+        )
+        _octant_swap_cache[device] = swap_flags
+    return swap_flags
 
 
 def _encode_quadrant_cells(frame: torch.Tensor) -> torch.Tensor:
@@ -80,6 +92,76 @@ def _encode_quadrant_cells(frame: torch.Tensor) -> torch.Tensor:
     return styles
 
 
+def _encode_octant_cells(frame: torch.Tensor) -> torch.Tensor:
+    if frame.shape[0] % 4:
+        pad_rows = 4 - (frame.shape[0] % 4)
+        frame = torch.cat([frame, frame[-1:, :, :].expand(pad_rows, -1, -1)], dim=0)
+    if frame.shape[1] % 2:
+        frame = torch.cat([frame, frame[:, -1:, :]], dim=1)
+
+    slices = (
+        frame[0::4, 0::2],
+        frame[0::4, 1::2],
+        frame[1::4, 0::2],
+        frame[1::4, 1::2],
+        frame[2::4, 0::2],
+        frame[2::4, 1::2],
+        frame[3::4, 0::2],
+        frame[3::4, 1::2],
+    )
+    pixels = torch.stack(slices, dim=2).to(torch.float32)
+    height, width = pixels.shape[:2]
+    cells = pixels.view(-1, 8, 3)
+    device = frame.device
+
+    luminance = (
+        0.299 * cells[:, :, 0] + 0.587 * cells[:, :, 1] + 0.114 * cells[:, :, 2]
+    )
+    threshold = luminance.mean(dim=1, keepdim=True)
+    fg_mask = luminance >= threshold
+
+    # Avoid degenerate all-on/all-off masks from flat rounding noise.
+    flat_cells = fg_mask.all(dim=1) | (~fg_mask).all(dim=1)
+    if flat_cells.any():
+        min_vals = luminance.argmin(dim=1)
+        max_vals = luminance.argmax(dim=1)
+        flat_idx = flat_cells.nonzero(as_tuple=False).squeeze(1)
+        fg_mask[flat_idx] = False
+        fg_mask[flat_idx, max_vals[flat_idx]] = True
+        varied_flat = (
+            luminance[flat_idx, max_vals[flat_idx]]
+            > luminance[flat_idx, min_vals[flat_idx]]
+        )
+        varied_idx = flat_idx[varied_flat]
+        if varied_idx.numel() > 0:
+            fg_mask[varied_idx, min_vals[varied_idx]] = False
+
+    fg_counts = fg_mask.sum(dim=1, keepdim=True).clamp_min(1)
+    bg_mask = ~fg_mask
+    bg_counts = bg_mask.sum(dim=1, keepdim=True).clamp_min(1)
+
+    fg = (cells * fg_mask.unsqueeze(-1)).sum(dim=1) / fg_counts
+    bg = (cells * bg_mask.unsqueeze(-1)).sum(dim=1) / bg_counts
+
+    bit_weights = torch.tensor(
+        (1, 2, 4, 8, 16, 32, 64, 128), dtype=torch.int64, device=device
+    )
+    mask_idx = (fg_mask.to(torch.int64) * bit_weights).sum(dim=1)
+
+    swap_flags = _get_octant_swap_flags(device).index_select(0, mask_idx)
+    fg_out = fg.clone()
+    bg_out = bg.clone()
+    if swap_flags.any():
+        fg_out[swap_flags] = bg[swap_flags]
+        bg_out[swap_flags] = fg[swap_flags]
+
+    styles = torch.empty((cells.size(0), 7), dtype=torch.uint8, device=device)
+    styles[:, 0:3] = fg_out.round().clamp(0, 255).to(torch.uint8)
+    styles[:, 3:6] = bg_out.round().clamp(0, 255).to(torch.uint8)
+    styles[:, 6] = mask_idx.to(torch.uint8)
+    return styles.view(height, width, 7)
+
+
 def pre_process_frame(
     previous_frame: Optional[torch.Tensor],
     frame: torch.Tensor,
@@ -89,9 +171,9 @@ def pre_process_frame(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     render_mode = str(getattr(config, "render_mode", "pixel")).lower()
 
-    if render_mode not in ("pixel", "quadrant"):
+    if render_mode not in ("pixel", "quadrant", "octant"):
         raise ValueError(
-            f"Unsupported render mode '{render_mode}'. Supported modes: pixel, quadrant"
+            f"Unsupported render mode '{render_mode}'. Supported modes: pixel, quadrant, octant"
         )
 
     if render_mode == "quadrant":
@@ -99,6 +181,13 @@ def pre_process_frame(
         cell_height = max(1, int(config.height) // quadrant_cell_divisor)
         cell_width = max(1, int(config.width) // quadrant_cell_divisor)
         target_height = max(1, cell_height * 2)
+        target_width = max(1, cell_width * 2)
+    elif render_mode == "octant":
+        width_divisor = max(1, int(getattr(config, "octant_cell_width_divisor", 2)))
+        height_divisor = max(1, int(getattr(config, "octant_cell_height_divisor", 4)))
+        cell_height = max(1, int(config.height) // height_divisor)
+        cell_width = max(1, int(config.width) // width_divisor)
+        target_height = max(1, cell_height * 4)
         target_width = max(1, cell_width * 2)
     else:
         target_height = int(config.height)
@@ -111,8 +200,11 @@ def pre_process_frame(
     if quant_mask_value != 0xFF:
         resized_frame = resized_frame & quant_mask_value
 
-    if render_mode == "quadrant":
-        cell_styles = _encode_quadrant_cells(resized_frame)
+    if render_mode in ("quadrant", "octant"):
+        if render_mode == "quadrant":
+            cell_styles = _encode_quadrant_cells(resized_frame)
+        else:
+            cell_styles = _encode_octant_cells(resized_frame)
         device = cell_styles.device
 
         if previous_frame is None or previous_frame.shape != cell_styles.shape:
