@@ -742,10 +742,10 @@ class AnsiRenderer:
         wait_time = target_time - now - lead
 
         sleep_time = 0.0
-        if wait_time > 0:
-            sleep_start = time.perf_counter()
-            # time.sleep(wait_time)
-            sleep_time = time.perf_counter() - sleep_start
+        # if wait_time > 0:
+        #     sleep_start = time.perf_counter()
+        #     # time.sleep(wait_time)
+        #     sleep_time = time.perf_counter() - sleep_start
 
         pending_event = self._pending_copy_done_event
         copy_wait_time = 0.0

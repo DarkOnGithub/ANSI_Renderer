@@ -705,21 +705,27 @@ def ansi_generate_rgb(
     g_lens = byte_lens[run_g].to(torch.int64)
     b_lens = byte_lens[run_b].to(torch.int64)
 
-    move_kind = torch.zeros(num_runs, dtype=torch.int8, device=device)
-    move_v = torch.zeros(num_runs, dtype=torch.int64, device=device)
-    move_h = torch.zeros(num_runs, dtype=torch.int64, device=device)
+    relative_cursor_moves = bool(getattr(cfg, "relative_cursor_moves", True))
+    if not relative_cursor_moves:
+        move_kind = needs_move.to(torch.int8)
+        move_v = row_idx
+        move_h = col_idx
+        move_lens = (2 + row_lens + 1 + col_lens + 1) * needs_move.to(torch.int64)
+    else:
+        move_kind = torch.zeros(num_runs, dtype=torch.int8, device=device)
+        move_v = torch.zeros(num_runs, dtype=torch.int64, device=device)
+        move_h = torch.zeros(num_runs, dtype=torch.int64, device=device)
 
-    move_kind[0] = 1
-    move_v[0] = row_idx[0]
-    move_h[0] = col_idx[0]
+        move_kind[0] = 1
+        move_v[0] = row_idx[0]
+        move_h[0] = col_idx[0]
 
-    if num_runs > 1:
-        move_indices = torch.where(needs_move[1:])[0] + 1
-        move_kind[move_indices] = 1
-        move_v[move_indices] = row_idx[move_indices]
-        move_h[move_indices] = col_idx[move_indices]
+        if num_runs > 1:
+            move_indices = torch.where(needs_move[1:])[0] + 1
+            move_kind[move_indices] = 1
+            move_v[move_indices] = row_idx[move_indices]
+            move_h[move_indices] = col_idx[move_indices]
 
-        if bool(getattr(cfg, "relative_cursor_moves", True)):
             prev_rows = run_ys[move_indices - 1]
             prev_cols_after = run_xs[move_indices - 1] + run_lengths[move_indices - 1]
             dy = run_ys[move_indices] - prev_rows
@@ -771,23 +777,23 @@ def ansi_generate_rgb(
             move_kind[combo_indices[(combo_dy < 0) & (combo_dx > 0)]] = 8
             move_kind[combo_indices[(combo_dy < 0) & (combo_dx < 0)]] = 9
 
-    move_lens = torch.zeros(num_runs, dtype=torch.int64, device=device)
+        move_lens = torch.zeros(num_runs, dtype=torch.int64, device=device)
 
-    abs_mask = move_kind == 1
-    move_lens[abs_mask] = 2 + row_lens[abs_mask] + 1 + col_lens[abs_mask] + 1
+        abs_mask = move_kind == 1
+        move_lens[abs_mask] = 2 + row_lens[abs_mask] + 1 + col_lens[abs_mask] + 1
 
-    h_mask = (move_kind == 2) | (move_kind == 3)
-    h_lens = byte_lens[move_h[h_mask].to(torch.long)].to(torch.int64)
-    move_lens[h_mask] = 2 + h_lens + 1
+        h_mask = (move_kind == 2) | (move_kind == 3)
+        h_lens = byte_lens[move_h[h_mask].to(torch.long)].to(torch.int64)
+        move_lens[h_mask] = 2 + h_lens + 1
 
-    v_mask = (move_kind == 4) | (move_kind == 5)
-    v_lens = byte_lens[move_v[v_mask].to(torch.long)].to(torch.int64)
-    move_lens[v_mask] = 2 + v_lens + 1
+        v_mask = (move_kind == 4) | (move_kind == 5)
+        v_lens = byte_lens[move_v[v_mask].to(torch.long)].to(torch.int64)
+        move_lens[v_mask] = 2 + v_lens + 1
 
-    combo_mask = move_kind >= 6
-    combo_v_lens = byte_lens[move_v[combo_mask].to(torch.long)].to(torch.int64)
-    combo_h_lens = byte_lens[move_h[combo_mask].to(torch.long)].to(torch.int64)
-    move_lens[combo_mask] = (2 + combo_v_lens + 1) + (2 + combo_h_lens + 1)
+        combo_mask = move_kind >= 6
+        combo_v_lens = byte_lens[move_v[combo_mask].to(torch.long)].to(torch.int64)
+        combo_h_lens = byte_lens[move_h[combo_mask].to(torch.long)].to(torch.int64)
+        move_lens[combo_mask] = (2 + combo_v_lens + 1) + (2 + combo_h_lens + 1)
 
     color_len_full = 7 + r_lens + 1 + g_lens + 1 + b_lens + 1
     color_part = color_len_full * needs_color_change.to(torch.int64)
@@ -1101,21 +1107,27 @@ def ansi_generate_quadrant(
     bg_g_lens = byte_lens[run_bg_g].to(torch.int64)
     bg_b_lens = byte_lens[run_bg_b].to(torch.int64)
 
-    move_kind = torch.zeros(num_runs, dtype=torch.int8, device=device)
-    move_v = torch.zeros(num_runs, dtype=torch.int64, device=device)
-    move_h = torch.zeros(num_runs, dtype=torch.int64, device=device)
+    relative_cursor_moves = bool(getattr(cfg, "relative_cursor_moves", True))
+    if not relative_cursor_moves:
+        move_kind = needs_move.to(torch.int8)
+        move_v = row_idx
+        move_h = col_idx
+        move_lens = (2 + row_lens + 1 + col_lens + 1) * needs_move.to(torch.int64)
+    else:
+        move_kind = torch.zeros(num_runs, dtype=torch.int8, device=device)
+        move_v = torch.zeros(num_runs, dtype=torch.int64, device=device)
+        move_h = torch.zeros(num_runs, dtype=torch.int64, device=device)
 
-    move_kind[0] = 1
-    move_v[0] = row_idx[0]
-    move_h[0] = col_idx[0]
+        move_kind[0] = 1
+        move_v[0] = row_idx[0]
+        move_h[0] = col_idx[0]
 
-    if num_runs > 1:
-        move_indices = torch.where(needs_move[1:])[0] + 1
-        move_kind[move_indices] = 1
-        move_v[move_indices] = row_idx[move_indices]
-        move_h[move_indices] = col_idx[move_indices]
+        if num_runs > 1:
+            move_indices = torch.where(needs_move[1:])[0] + 1
+            move_kind[move_indices] = 1
+            move_v[move_indices] = row_idx[move_indices]
+            move_h[move_indices] = col_idx[move_indices]
 
-        if bool(getattr(cfg, "relative_cursor_moves", True)):
             prev_rows = run_ys[move_indices - 1]
             prev_cols_after = run_xs[move_indices - 1] + run_lengths[move_indices - 1]
             dy = run_ys[move_indices] - prev_rows
@@ -1167,23 +1179,23 @@ def ansi_generate_quadrant(
             move_kind[combo_indices[(combo_dy < 0) & (combo_dx > 0)]] = 8
             move_kind[combo_indices[(combo_dy < 0) & (combo_dx < 0)]] = 9
 
-    move_lens = torch.zeros(num_runs, dtype=torch.int64, device=device)
+        move_lens = torch.zeros(num_runs, dtype=torch.int64, device=device)
 
-    abs_mask = move_kind == 1
-    move_lens[abs_mask] = 2 + row_lens[abs_mask] + 1 + col_lens[abs_mask] + 1
+        abs_mask = move_kind == 1
+        move_lens[abs_mask] = 2 + row_lens[abs_mask] + 1 + col_lens[abs_mask] + 1
 
-    h_mask = (move_kind == 2) | (move_kind == 3)
-    h_lens = byte_lens[move_h[h_mask].to(torch.long)].to(torch.int64)
-    move_lens[h_mask] = 2 + h_lens + 1
+        h_mask = (move_kind == 2) | (move_kind == 3)
+        h_lens = byte_lens[move_h[h_mask].to(torch.long)].to(torch.int64)
+        move_lens[h_mask] = 2 + h_lens + 1
 
-    v_mask = (move_kind == 4) | (move_kind == 5)
-    v_lens = byte_lens[move_v[v_mask].to(torch.long)].to(torch.int64)
-    move_lens[v_mask] = 2 + v_lens + 1
+        v_mask = (move_kind == 4) | (move_kind == 5)
+        v_lens = byte_lens[move_v[v_mask].to(torch.long)].to(torch.int64)
+        move_lens[v_mask] = 2 + v_lens + 1
 
-    combo_mask = move_kind >= 6
-    combo_v_lens = byte_lens[move_v[combo_mask].to(torch.long)].to(torch.int64)
-    combo_h_lens = byte_lens[move_h[combo_mask].to(torch.long)].to(torch.int64)
-    move_lens[combo_mask] = (2 + combo_v_lens + 1) + (2 + combo_h_lens + 1)
+        combo_mask = move_kind >= 6
+        combo_v_lens = byte_lens[move_v[combo_mask].to(torch.long)].to(torch.int64)
+        combo_h_lens = byte_lens[move_h[combo_mask].to(torch.long)].to(torch.int64)
+        move_lens[combo_mask] = (2 + combo_v_lens + 1) + (2 + combo_h_lens + 1)
 
     fg_len_full = 7 + fg_r_lens + 1 + fg_g_lens + 1 + fg_b_lens + 1
     bg_len_full = 7 + bg_r_lens + 1 + bg_g_lens + 1 + bg_b_lens + 1
@@ -1370,21 +1382,27 @@ def ansi_generate_octant(
     bg_g_lens = byte_lens[run_bg_g].to(torch.int64)
     bg_b_lens = byte_lens[run_bg_b].to(torch.int64)
 
-    move_kind = torch.zeros(num_runs, dtype=torch.int8, device=device)
-    move_v = torch.zeros(num_runs, dtype=torch.int64, device=device)
-    move_h = torch.zeros(num_runs, dtype=torch.int64, device=device)
+    relative_cursor_moves = bool(getattr(cfg, "relative_cursor_moves", True))
+    if not relative_cursor_moves:
+        move_kind = needs_move.to(torch.int8)
+        move_v = row_idx
+        move_h = col_idx
+        move_lens = (2 + row_lens + 1 + col_lens + 1) * needs_move.to(torch.int64)
+    else:
+        move_kind = torch.zeros(num_runs, dtype=torch.int8, device=device)
+        move_v = torch.zeros(num_runs, dtype=torch.int64, device=device)
+        move_h = torch.zeros(num_runs, dtype=torch.int64, device=device)
 
-    move_kind[0] = 1
-    move_v[0] = row_idx[0]
-    move_h[0] = col_idx[0]
+        move_kind[0] = 1
+        move_v[0] = row_idx[0]
+        move_h[0] = col_idx[0]
 
-    if num_runs > 1:
-        move_indices = torch.where(needs_move[1:])[0] + 1
-        move_kind[move_indices] = 1
-        move_v[move_indices] = row_idx[move_indices]
-        move_h[move_indices] = col_idx[move_indices]
+        if num_runs > 1:
+            move_indices = torch.where(needs_move[1:])[0] + 1
+            move_kind[move_indices] = 1
+            move_v[move_indices] = row_idx[move_indices]
+            move_h[move_indices] = col_idx[move_indices]
 
-        if bool(getattr(cfg, "relative_cursor_moves", True)):
             prev_rows = run_ys[move_indices - 1]
             prev_cols_after = run_xs[move_indices - 1] + run_lengths[move_indices - 1]
             dy = run_ys[move_indices] - prev_rows
@@ -1436,23 +1454,23 @@ def ansi_generate_octant(
             move_kind[combo_indices[(combo_dy < 0) & (combo_dx > 0)]] = 8
             move_kind[combo_indices[(combo_dy < 0) & (combo_dx < 0)]] = 9
 
-    move_lens = torch.zeros(num_runs, dtype=torch.int64, device=device)
+        move_lens = torch.zeros(num_runs, dtype=torch.int64, device=device)
 
-    abs_mask = move_kind == 1
-    move_lens[abs_mask] = 2 + row_lens[abs_mask] + 1 + col_lens[abs_mask] + 1
+        abs_mask = move_kind == 1
+        move_lens[abs_mask] = 2 + row_lens[abs_mask] + 1 + col_lens[abs_mask] + 1
 
-    h_mask = (move_kind == 2) | (move_kind == 3)
-    h_lens = byte_lens[move_h[h_mask].to(torch.long)].to(torch.int64)
-    move_lens[h_mask] = 2 + h_lens + 1
+        h_mask = (move_kind == 2) | (move_kind == 3)
+        h_lens = byte_lens[move_h[h_mask].to(torch.long)].to(torch.int64)
+        move_lens[h_mask] = 2 + h_lens + 1
 
-    v_mask = (move_kind == 4) | (move_kind == 5)
-    v_lens = byte_lens[move_v[v_mask].to(torch.long)].to(torch.int64)
-    move_lens[v_mask] = 2 + v_lens + 1
+        v_mask = (move_kind == 4) | (move_kind == 5)
+        v_lens = byte_lens[move_v[v_mask].to(torch.long)].to(torch.int64)
+        move_lens[v_mask] = 2 + v_lens + 1
 
-    combo_mask = move_kind >= 6
-    combo_v_lens = byte_lens[move_v[combo_mask].to(torch.long)].to(torch.int64)
-    combo_h_lens = byte_lens[move_h[combo_mask].to(torch.long)].to(torch.int64)
-    move_lens[combo_mask] = (2 + combo_v_lens + 1) + (2 + combo_h_lens + 1)
+        combo_mask = move_kind >= 6
+        combo_v_lens = byte_lens[move_v[combo_mask].to(torch.long)].to(torch.int64)
+        combo_h_lens = byte_lens[move_h[combo_mask].to(torch.long)].to(torch.int64)
+        move_lens[combo_mask] = (2 + combo_v_lens + 1) + (2 + combo_h_lens + 1)
 
     fg_len_full = 7 + fg_r_lens + 1 + fg_g_lens + 1 + fg_b_lens + 1
     bg_len_full = 7 + bg_r_lens + 1 + bg_g_lens + 1 + bg_b_lens + 1

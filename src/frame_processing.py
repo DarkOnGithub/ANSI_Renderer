@@ -28,16 +28,23 @@ _QUADRANT_MASKS = (
     (1, 1, 1, 1),
 )
 
-_quadrant_mask_cache: dict[torch.device, torch.Tensor] = {}
+_quadrant_mask_cache: dict[
+    torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
 _octant_swap_cache: dict[torch.device, torch.Tensor] = {}
 
 
-def _get_quadrant_masks(device: torch.device) -> torch.Tensor:
-    masks = _quadrant_mask_cache.get(device)
-    if masks is None:
+def _get_quadrant_masks(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cached = _quadrant_mask_cache.get(device)
+    if cached is None:
         masks = torch.tensor(_QUADRANT_MASKS, dtype=torch.float32, device=device)
-        _quadrant_mask_cache[device] = masks
-    return masks
+        fg_counts = masks.sum(dim=1).view(1, len(_QUADRANT_MASKS), 1).clamp_min(1.0)
+        bg_counts = (1.0 - masks).sum(dim=1).view(1, len(_QUADRANT_MASKS), 1)
+        cached = (masks, fg_counts, bg_counts.clamp_min(1.0))
+        _quadrant_mask_cache[device] = cached
+    return cached
 
 
 def _get_octant_swap_flags(device: torch.device) -> torch.Tensor:
@@ -59,38 +66,37 @@ def _encode_quadrant_cells(frame: torch.Tensor) -> torch.Tensor:
     bl = frame[1::2, 0::2]
     br = frame[1::2, 1::2]
 
-    pixels = torch.stack((tl, tr, bl, br), dim=2).to(torch.float32)
-    masks = _get_quadrant_masks(frame.device)
-    inv_masks = 1.0 - masks
+    cells = torch.stack((tl, tr, bl, br), dim=2).to(torch.float32)
+    height, width = cells.shape[:2]
+    flat_cells = cells.reshape(-1, 4, 3)
+    masks, fg_counts, bg_counts = _get_quadrant_masks(frame.device)
 
-    pixels_exp = pixels.unsqueeze(2)
-    masks_exp = masks.view(1, 1, 16, 4, 1)
-    inv_masks_exp = inv_masks.view(1, 1, 16, 4, 1)
+    fg_sums = torch.einsum("nqc,mq->nmc", flat_cells, masks)
+    total_sums = flat_cells.sum(dim=1, keepdim=True)
+    bg_sums = total_sums - fg_sums
 
-    fg_counts = masks.sum(dim=1).view(1, 1, 16, 1).clamp_min(1.0)
-    bg_counts = inv_masks.sum(dim=1).view(1, 1, 16, 1).clamp_min(1.0)
+    cell_sq_sums = (flat_cells * flat_cells).sum(dim=2)
+    fg_sq_sums = torch.einsum("nq,mq->nm", cell_sq_sums, masks)
+    total_sq_sums = cell_sq_sums.sum(dim=1, keepdim=True)
+    bg_sq_sums = total_sq_sums - fg_sq_sums
 
-    fg = (pixels_exp * masks_exp).sum(dim=3) / fg_counts
-    bg = (pixels_exp * inv_masks_exp).sum(dim=3) / bg_counts
+    fg_means = fg_sums / fg_counts
+    bg_means = bg_sums / bg_counts
+    fg_errors = fg_sq_sums - (fg_sums * fg_sums).sum(dim=2) / fg_counts.squeeze(-1)
+    bg_errors = bg_sq_sums - (bg_sums * bg_sums).sum(dim=2) / bg_counts.squeeze(-1)
 
-    assigned = torch.where(masks_exp.bool(), fg.unsqueeze(3), bg.unsqueeze(3))
-    errors = ((pixels_exp - assigned) ** 2).sum(dim=(3, 4))
-
-    glyph_idx = errors.argmin(dim=2)
-    gather_idx = glyph_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 3)
-
-    fg_best = fg.gather(dim=2, index=gather_idx).squeeze(2)
-    bg_best = bg.gather(dim=2, index=gather_idx).squeeze(2)
+    flat_glyph_idx = (fg_errors + bg_errors).argmin(dim=1)
+    cell_indices = torch.arange(flat_cells.size(0), device=frame.device)
+    fg_best = fg_means[cell_indices, flat_glyph_idx]
+    bg_best = bg_means[cell_indices, flat_glyph_idx]
 
     styles = torch.empty(
-        (glyph_idx.shape[0], glyph_idx.shape[1], 7),
-        dtype=torch.uint8,
-        device=frame.device,
+        (flat_cells.size(0), 7), dtype=torch.uint8, device=frame.device
     )
-    styles[..., 0:3] = fg_best.round().clamp(0, 255).to(torch.uint8)
-    styles[..., 3:6] = bg_best.round().clamp(0, 255).to(torch.uint8)
-    styles[..., 6] = glyph_idx.to(torch.uint8)
-    return styles
+    styles[:, 0:3] = fg_best.round().clamp(0, 255).to(torch.uint8)
+    styles[:, 3:6] = bg_best.round().clamp(0, 255).to(torch.uint8)
+    styles[:, 6] = flat_glyph_idx.to(torch.uint8)
+    return styles.view(height, width, 7)
 
 
 def _encode_octant_cells(frame: torch.Tensor) -> torch.Tensor:
