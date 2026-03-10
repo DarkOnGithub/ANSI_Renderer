@@ -1,15 +1,27 @@
-import math
-import torch
-from src.ansi_renderer import AnsiRenderer
-import cv2 as cv
+import os
 import os
 import subprocess
+import traceback
+from typing import Generator
+
+import cv2 as cv
 import numpy as np
+import torch
+
+from src.ansi_renderer import AnsiRenderer
 from src.config import Config
 
+DEFAULT_VIDEO_PATH = (
+    r"(Extreme Demon) ''Tidal Wave'' by OniLinkGD ｜ Geometry Dash [YbyfDYChIYU].mp4"
+)
+TIMING_FILE = "timing_object.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-video_path = r"(Extreme Demon) ''Tidal Wave'' by OniLinkGD ｜ Geometry Dash [YbyfDYChIYU].mp4"
+def resolve_video_path(path: str) -> str:
+    if os.path.isabs(path):
+        return path
+    return os.path.join(BASE_DIR, path)
 
 
 def open_software_capture(path: str) -> cv.VideoCapture:
@@ -55,23 +67,28 @@ def get_video_fps(path: str) -> float:
         return fps
     except Exception:
         cap = open_software_capture(path)
-        fps = cap.get(cv.CAP_PROP_FPS)
-        cap.release()
-        return fps
+        try:
+            fps = cap.get(cv.CAP_PROP_FPS)
+        finally:
+            cap.release()
+        return fps if fps > 0 else 30.0
 
 
 def get_target_render_size() -> tuple[int, int]:
+    return 1280, 720
     try:
         term_size = os.get_terminal_size()
         cols = max(80, term_size.columns - 1)
         rows = max(24, term_size.lines - 1)
     except OSError:
-        cols, rows = 160, 48
+        cols, rows = 80, 24
 
-    return cols, rows
+    return cols * 2, rows * 4
 
 
-def ffmpeg_frame_generator(path: str):
+def ffmpeg_frame_generator(
+    path: str, device: torch.device
+) -> Generator[torch.Tensor, None, None]:
     width, height, _ = probe_video_stream(path)
     frame_bytes = width * height * 3
     cmd = [
@@ -97,85 +114,99 @@ def ffmpeg_frame_generator(path: str):
             frame_np = (
                 np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy()
             )
-            frame_rgb = torch.from_numpy(frame_np)
-            yield frame_rgb.to(torch.device("cuda"))
+            yield torch.from_numpy(frame_np).to(device)
     finally:
         proc.terminate()
         proc.wait()
 
 
-def get_frame_generator(video_path: str):
-    cap = open_software_capture(video_path)
+def get_frame_generator(
+    path: str, device: torch.device
+) -> Generator[torch.Tensor, None, None]:
+    cap = open_software_capture(path)
     if not cap.isOpened():
-        yield from ffmpeg_frame_generator(video_path)
+        yield from ffmpeg_frame_generator(path, device)
         return
 
     ret, frame = cap.read()
     if not ret:
         cap.release()
-        yield from ffmpeg_frame_generator(video_path)
+        yield from ffmpeg_frame_generator(path, device)
         return
 
-    frame_rgb = torch.from_numpy(frame[:, :, [2, 1, 0]]).to(torch.device("cuda"))
-    yield frame_rgb
+    try:
+        frame_rgb = torch.from_numpy(frame[:, :, [2, 1, 0]])
+        yield frame_rgb.to(device)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_rgb = torch.from_numpy(frame[:, :, [2, 1, 0]]).to(
-            torch.device("cuda")
-        )  # Keep as (H, W, C)
-        yield frame_rgb
-    cap.release()
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_rgb = torch.from_numpy(frame[:, :, [2, 1, 0]])
+            yield frame_rgb.to(device)
+    finally:
+        cap.release()
 
 
-fps = get_video_fps(video_path)
-config = Config(
-    width=1280,
-    height=720,
-    device=torch.device("cuda"),
-    fps=fps,
-    audio_path=video_path,
-    render_mode="octant",
-    octant_cell_width_divisor=2,
-    octant_cell_height_divisor=4,
-    quant_mask=0xFC,
-    diff_thresh=2,
-    run_color_diff_thresh=3,
-    adaptive_quality=True,
-    adaptive_quant_masks=(0xFC, 0xF8, 0xF0, 0xE0),
-    adaptive_diff_thresh_offsets=(0, 2, 5, 9),
-    adaptive_run_color_diff_offsets=(0, 3, 7, 12),
-    adaptive_ema_alpha=0.12,
-    target_frame_bytes=2_200_000,
-    frame_byte_buffer_frames=10,
-    max_frame_bytes=2_600_000,
-    relative_cursor_moves=True,
-    use_rep=True,
-    rep_min_run=4,
-    sync_output=True,
-    prefer_writev=True,
-    write_chunk_size=2_097_152,
-    queue_size=10,
-    buffer_pool_size=12,
-    initial_buffer_size=16 * 1024 * 1024,
-    async_copy_stream=True,
-    pacing_render_lead=True,
-    pacing_render_alpha=0.18,
-    timing_enabled=True,
-    timing_file="timing_object.csv",
-)
-renderer = AnsiRenderer(frame_generator=get_frame_generator(video_path), config=config)
+def build_config(video_path: str) -> Config:
+    width, height = get_target_render_size()
+    fps = get_video_fps(video_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-try:
-    for ansi, frame_idx in renderer.get_next_ansi_sequence():
-        renderer.render_frame(ansi, frame_idx)
-except KeyboardInterrupt:
-    print("\nInterrupted by user. Exiting...")
-except Exception as e:
-    print(f"Main thread caught exception: {e}")
-    import traceback
+    return Config(
+        width=width,
+        height=height,
+        device=device,
+        fps=fps,
+        audio_path=video_path,
+        render_mode="quadrant",
+        quadrant_cell_divisor=2,
+        quant_mask=0xFF,
+        diff_thresh=0,
+        run_color_diff_thresh=0,
+        adaptive_quality=False,
+        adaptive_quant_masks=(0xFF,),
+        adaptive_diff_thresh_offsets=(0,),
+        adaptive_run_color_diff_offsets=(0,),
+        adaptive_ema_alpha=0.12,
+        target_frame_bytes=0,
+        frame_byte_buffer_frames=8,
+        max_frame_bytes=0,
+        relative_cursor_moves=True,
+        use_rep=False,
+        rep_min_run=12,
+        sync_output=True,
+        prefer_writev=True,
+        write_chunk_size=2_097_152,
+        queue_size=12,
+        buffer_pool_size=14,
+        initial_buffer_size=16 * 1024 * 1024,
+        async_copy_stream=True,
+        pacing_render_lead=True,
+        pacing_render_alpha=0.18,
+        timing_enabled=True,
+        timing_file=TIMING_FILE,
+    )
 
-    traceback.print_exc()
-    print("Program exiting due to thread crash")
+
+def main() -> None:
+    video_path = resolve_video_path(DEFAULT_VIDEO_PATH)
+    config = build_config(video_path)
+    renderer = AnsiRenderer(
+        frame_generator=get_frame_generator(video_path, config.device),
+        config=config,
+    )
+
+    try:
+        for ansi, frame_idx in renderer.get_next_ansi_sequence():
+            renderer.render_frame(ansi, frame_idx)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Exiting...")
+    except Exception as exc:
+        print(f"Main thread caught exception: {exc}")
+        traceback.print_exc()
+        print("Program exiting due to thread crash")
+
+
+if __name__ == "__main__":
+    main()

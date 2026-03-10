@@ -1,6 +1,7 @@
 import argparse
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 import json
 import os
 import queue
@@ -37,6 +38,21 @@ from src.frame_processing import pre_process_frame
 PANE_ORDER = ("top_left", "top_right", "bottom_left", "bottom_right")
 INIT_SEQUENCE = ENABLE_ALT_BUFFER + CLEAR_SCREEN + HIDE_CURSOR + b"\033[H"
 FINAL_SEQUENCE = SHOW_CURSOR + DISABLE_ALT_BUFFER
+FPS_OVERLAY_FONT = {
+    " ": ("000", "000", "000", "000", "000"),
+    ".": ("000", "000", "000", "000", "010"),
+    "/": ("001", "001", "010", "100", "100"),
+    "0": ("111", "101", "101", "101", "111"),
+    "1": ("010", "110", "010", "010", "111"),
+    "2": ("111", "001", "111", "100", "111"),
+    "3": ("111", "001", "111", "001", "111"),
+    "4": ("101", "101", "111", "001", "001"),
+    "5": ("111", "100", "111", "001", "111"),
+    "6": ("111", "100", "111", "101", "111"),
+    "7": ("111", "001", "010", "100", "100"),
+    "8": ("111", "101", "111", "101", "111"),
+    "9": ("111", "101", "111", "001", "111"),
+}
 
 
 class PaneDisconnectedError(RuntimeError):
@@ -62,6 +78,7 @@ class PaneRuntime:
     spec: PaneSpec
     fd: int
     renderer: AnsiRenderer
+    cell_bounds: tuple[int, int, int, int] | None = None
     previous_frame: torch.Tensor | None = None
     previous_frame_scratch: torch.Tensor | None = None
     build_stream: torch.cuda.Stream | None = None
@@ -739,6 +756,22 @@ def fit_frame_to_canvas(
     return canvas
 
 
+def ensure_canvas_frame(
+    frame: torch.Tensor,
+    target_height: int,
+    target_width: int,
+    cell_aspect: float = CELL_ASPECT,
+) -> torch.Tensor:
+    if frame.shape[0] == target_height and frame.shape[1] == target_width:
+        return frame
+    return fit_frame_to_canvas(
+        frame,
+        target_height,
+        target_width,
+        cell_aspect=cell_aspect,
+    )
+
+
 def build_renderer(
     spec: PaneSpec, args: argparse.Namespace, fps: float, device: torch.device
 ) -> AnsiRenderer:
@@ -771,9 +804,9 @@ def build_configured_renderer(
         quadrant_cell_divisor=2,
         octant_cell_width_divisor=2,
         octant_cell_height_divisor=4,
-        quant_mask=0xFF,
-        diff_thresh=0,
-        run_color_diff_thresh=0,
+        quant_mask=0xFC,
+        diff_thresh=4,
+        run_color_diff_thresh=4,
         adaptive_quality=False,
         adaptive_quant_masks=(0xFF,),
         adaptive_diff_thresh_offsets=(0,),
@@ -886,25 +919,6 @@ def clone_previous_frame(pane: PaneRuntime) -> torch.Tensor | None:
     ):
         scratch = previous_frame.clone()
         pane.previous_frame_scratch = scratch
-    else:
-        scratch.copy_(previous_frame)
-    return scratch
-
-
-def clone_shared_previous_frame(runtime: SharedBuildRuntime) -> torch.Tensor | None:
-    previous_frame = runtime.previous_frame
-    if previous_frame is None:
-        return None
-
-    scratch = runtime.previous_frame_scratch
-    if (
-        scratch is None
-        or scratch.shape != previous_frame.shape
-        or scratch.dtype != previous_frame.dtype
-        or scratch.device != previous_frame.device
-    ):
-        scratch = previous_frame.clone()
-        runtime.previous_frame_scratch = scratch
     else:
         scratch.copy_(previous_frame)
     return scratch
@@ -1099,7 +1113,7 @@ def build_shared_pane_payloads_with_stats(
     args: argparse.Namespace,
 ) -> tuple[list[PanePayload], dict[str, float], GpuBuildTiming | None, torch.Tensor]:
     config = runtime.renderer.config
-    previous_frame = clone_shared_previous_frame(runtime)
+    previous_frame = runtime.previous_frame
 
     preprocess_gpu_timing = GpuBuildTiming() if runtime.renderer.cuda_enabled else None
     preprocess_segment = (
@@ -1120,17 +1134,39 @@ def build_shared_pane_payloads_with_stats(
 
     payloads: list[PanePayload] = []
     pane_build_times = {pane.spec.pane_id: 0.0 for pane in panes}
-    render_mode = str(args.render_mode).lower()
-
-    for pane in panes:
-        pane_build_start = time.perf_counter()
-        x0, x1, y0, y1 = pane_cell_bounds(
+    pane_bounds = {
+        pane.spec.pane_id: pane.cell_bounds
+        if pane.cell_bounds is not None
+        else pane_cell_bounds(
             pane.spec,
-            render_mode,
+            str(args.render_mode).lower(),
             int(args.quadrant_cell_divisor),
             int(args.octant_cell_width_divisor),
             int(args.octant_cell_height_divisor),
         )
+        for pane in panes
+    }
+    pane_selectors: dict[str, torch.Tensor] | None = None
+    x_edges = sorted(
+        {bound[0] for bound in pane_bounds.values()}
+        | {bound[1] for bound in pane_bounds.values()}
+    )
+    y_edges = sorted(
+        {bound[2] for bound in pane_bounds.values()}
+        | {bound[3] for bound in pane_bounds.values()}
+    )
+    if len(x_edges) == 3 and len(y_edges) == 3 and xs.numel() > 0:
+        pane_index = (xs >= x_edges[1]).to(torch.int64)
+        pane_index = pane_index + ((ys >= y_edges[1]).to(torch.int64) * 2)
+        pane_selectors = {
+            pane_id: torch.where(pane_index == pane_idx)[0]
+            for pane_idx, pane_id in enumerate(PANE_ORDER)
+        }
+
+    for pane in panes:
+        pane_build_start = time.perf_counter()
+        pane_id = pane.spec.pane_id
+        x0, x1, y0, y1 = pane_bounds[pane_id]
         next_previous_frame = updated_previous[y0:y1, x0:x1]
         pane_gpu_timing = GpuBuildTiming() if runtime.renderer.cuda_enabled else None
 
@@ -1150,8 +1186,13 @@ def build_shared_pane_payloads_with_stats(
             )
             continue
 
-        pane_mask = (xs >= x0) & (xs < x1) & (ys >= y0) & (ys < y1)
-        if not bool(pane_mask.any()):
+        pane_selector = None if pane_selectors is None else pane_selectors.get(pane_id)
+        if pane_selector is None:
+            pane_selector = torch.where(
+                (xs >= x0) & (xs < x1) & (ys >= y0) & (ys < y1)
+            )[0]
+
+        if pane_selector.numel() == 0:
             payloads.append(
                 PanePayload(
                     pane=pane,
@@ -1167,9 +1208,9 @@ def build_shared_pane_payloads_with_stats(
             )
             continue
 
-        pane_xs = xs[pane_mask] - x0
-        pane_ys = ys[pane_mask] - y0
-        pane_colors = colors_rgb[pane_mask]
+        pane_xs = xs.index_select(0, pane_selector) - x0
+        pane_ys = ys.index_select(0, pane_selector) - y0
+        pane_colors = colors_rgb.index_select(0, pane_selector)
 
         build_stream = pane.build_stream
         if build_stream is not None:
@@ -1545,6 +1586,70 @@ def emit_runtime_stats(
     stats.reset_window(now)
 
 
+def current_shown_fps(
+    stats: RuntimeStats, now: float, next_presented: int = 0
+) -> float:
+    elapsed = max(now - stats.window_started_at, 1e-6)
+    return (stats.presented + max(0, int(next_presented))) / elapsed
+
+
+def fps_overlay_text(stats: RuntimeStats, now: float, fps: float) -> str:
+    return f"{current_shown_fps(stats, now, next_presented=1):04.1f}/{fps:04.1f}"
+
+
+@lru_cache(maxsize=256)
+def render_fps_overlay_patch(text: str, scale: int) -> np.ndarray:
+    font_height = 5
+    gap = scale
+    border = scale
+    glyph_masks = [
+        np.array(
+            [list(row) for row in FPS_OVERLAY_FONT.get(char, FPS_OVERLAY_FONT[" "])],
+            dtype="U1",
+        )
+        == "1"
+        for char in text
+    ]
+
+    text_width = sum(mask.shape[1] * scale + gap for mask in glyph_masks) - gap
+    text_height = font_height * scale
+    patch = np.zeros(
+        (text_height + (border * 2), text_width + (border * 2), 3),
+        dtype=np.uint8,
+    )
+    cursor_x = border
+    cursor_y = border
+    for mask in glyph_masks:
+        expanded = np.repeat(np.repeat(mask, scale, axis=0), scale, axis=1)
+        glyph_height, glyph_width = expanded.shape
+        patch[
+            cursor_y : cursor_y + glyph_height,
+            cursor_x : cursor_x + glyph_width,
+        ][expanded] = 255
+        cursor_x += glyph_width + gap
+    return patch
+
+
+def draw_fps_overlay(frame: np.ndarray, text: str) -> None:
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        return
+
+    scale = max(1, min(frame.shape[0] // 24, frame.shape[1] // 80, 3))
+    margin = scale
+    overlay = render_fps_overlay_patch(text, scale)
+    box_height, box_width = overlay.shape[:2]
+
+    frame_height, frame_width = frame.shape[:2]
+    if box_width + margin > frame_width or box_height + margin > frame_height:
+        return
+
+    x0 = margin
+    y0 = margin
+    x1 = x0 + box_width
+    y1 = y0 + box_height
+    frame[y0:y1, x0:x1] = overlay.astype(frame.dtype, copy=False)
+
+
 def should_drop_frame(
     now: float,
     start_time: float,
@@ -1590,6 +1695,13 @@ def open_panes(
                 spec=spec,
                 fd=fd,
                 renderer=renderer,
+                cell_bounds=pane_cell_bounds(
+                    spec,
+                    str(args.render_mode).lower(),
+                    int(args.quadrant_cell_divisor),
+                    int(args.octant_cell_width_divisor),
+                    int(args.octant_cell_height_divisor),
+                ),
                 build_stream=build_stream,
                 copy_stream=copy_stream,
             )
@@ -1615,6 +1727,11 @@ def close_launched_session(session: dict) -> None:
         pid = pane.get("pid")
         if isinstance(pid, int) and pid > 0:
             pane_pids.append(pid)
+    focus_window = session.get("focus_window")
+    if isinstance(focus_window, dict):
+        focus_pid = focus_window.get("pid")
+        if isinstance(focus_pid, int) and focus_pid > 0:
+            pane_pids.append(focus_pid)
 
     for pid in pane_pids:
         try:
@@ -1691,6 +1808,15 @@ def main() -> int:
     pane_specs, total_width, total_height = build_pane_specs(session, args)
 
     source_width, source_height, fps = probe_video_stream(video_path)
+    decode_vf = build_ffmpeg_canvas_filter(
+        source_width,
+        source_height,
+        total_width,
+        total_height,
+        cell_aspect=args.cell_aspect,
+    )
+    reader_output_width = total_width if decode_vf is not None else source_width
+    reader_output_height = total_height if decode_vf is not None else source_height
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     panes = open_panes(pane_specs, args, fps, device)
     shared_runtime = build_shared_runtime(total_width, total_height, args, fps, device)
@@ -1710,7 +1836,14 @@ def main() -> int:
             timing_handle = open(args.timing_file, "w", encoding="utf-8")
             timing_handle.write(timing_csv_header(pane_ids))
 
-        frame_reader = LatestFrameReader(video_path, source_width, source_height)
+        frame_reader = LatestFrameReader(
+            video_path,
+            source_width,
+            source_height,
+            output_width=reader_output_width,
+            output_height=reader_output_height,
+            vf=decode_vf,
+        )
 
         warmup_canvas = torch.zeros(
             (total_height, total_width, 3), dtype=torch.uint8, device=device
@@ -1731,11 +1864,15 @@ def main() -> int:
             return 0
         first_frame_idx, first_frame_np = first_item
         first_skipped_input_frames = max(0, int(first_frame_idx))
+        draw_fps_overlay(
+            first_frame_np,
+            fps_overlay_text(stats, time.perf_counter(), fps),
+        )
         first_upload_start = time.perf_counter()
         first_frame = torch.from_numpy(first_frame_np).to(device)
         first_upload_time = time.perf_counter() - first_upload_start
         first_build_start = time.perf_counter()
-        first_canvas = fit_frame_to_canvas(
+        first_canvas = ensure_canvas_frame(
             first_frame,
             total_height,
             total_width,
@@ -1900,11 +2037,15 @@ def main() -> int:
                 playback_frame_idx += 1
                 continue
 
+            draw_fps_overlay(
+                frame_np,
+                fps_overlay_text(stats, time.perf_counter(), fps),
+            )
             upload_start = time.perf_counter()
             frame = torch.from_numpy(frame_np).to(device)
             upload_time = time.perf_counter() - upload_start
             build_start = time.perf_counter()
-            canvas = fit_frame_to_canvas(
+            canvas = ensure_canvas_frame(
                 frame,
                 total_height,
                 total_width,
