@@ -767,7 +767,7 @@ def build_configured_renderer(
         height=height,
         device=device,
         fps=fps,
-        render_mode="octant",
+        render_mode="quadrant",
         quadrant_cell_divisor=2,
         octant_cell_width_divisor=2,
         octant_cell_height_divisor=4,
