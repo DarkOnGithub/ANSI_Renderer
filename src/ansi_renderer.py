@@ -1,8 +1,10 @@
 import os
 import queue
+import os
 import subprocess
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import Any, Generator
 
 import torch
@@ -14,11 +16,43 @@ from .frame_processing import pre_process_frame
 from .utils import setup_lookup
 
 
+@dataclass
+class GpuBuildTiming:
+    preprocess_segments: list[tuple[torch.cuda.Event, torch.cuda.Event]] = field(
+        default_factory=list
+    )
+    gen_segments: list[tuple[torch.cuda.Event, torch.cuda.Event]] = field(
+        default_factory=list
+    )
+
+    def synchronize(self) -> None:
+        for _, end_event in self.preprocess_segments:
+            end_event.synchronize()
+        for _, end_event in self.gen_segments:
+            end_event.synchronize()
+
+    def preprocess_ms(self) -> float:
+        return sum(
+            float(start_event.elapsed_time(end_event))
+            for start_event, end_event in self.preprocess_segments
+        )
+
+    def gen_ms(self) -> float:
+        return sum(
+            float(start_event.elapsed_time(end_event))
+            for start_event, end_event in self.gen_segments
+        )
+
+    def total_ms(self) -> float:
+        return self.preprocess_ms() + self.gen_ms()
+
+
 class AnsiRenderer:
     def __init__(
         self,
         frame_generator: Generator[torch.Tensor, None, None],
         config: Config,
+        autostart: bool = True,
     ):
         self.frame_generator = frame_generator
         self.config = config
@@ -58,6 +92,7 @@ class AnsiRenderer:
         self.rendered_frames = 0
         self.audio_process = None
         self._render_time_ema = 0.0
+        self._output_initialized = False
 
         self._quality_level = 0
         self._producer_time_ema = None
@@ -90,7 +125,25 @@ class AnsiRenderer:
         else:
             self.timing_f = None
 
-        self.generator_thread.start()
+        if autostart:
+            self.generator_thread.start()
+
+    def build_frame_payload(
+        self,
+        previous_frame: torch.Tensor | None,
+        frame: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor,
+        float,
+        float,
+        int,
+        int,
+        int,
+        int,
+        GpuBuildTiming | None,
+    ]:
+        return self._build_frame_payload(previous_frame, frame)
 
     def _build_adaptive_profiles(
         self,
@@ -435,7 +488,17 @@ class AnsiRenderer:
         self,
         previous_frame: torch.Tensor | None,
         frame: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor, float, float, int, int, int, int]:
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor,
+        float,
+        float,
+        int,
+        int,
+        int,
+        int,
+        GpuBuildTiming | None,
+    ]:
         old_shape = previous_frame.shape if previous_frame is not None else None
         max_level = len(self._adaptive_quant_masks) - 1
         start_level = min(max(int(self._quality_level), 0), max_level)
@@ -453,6 +516,7 @@ class AnsiRenderer:
         preprocess_time = 0.0
         gen_time = 0.0
         level = start_level
+        gpu_timing = GpuBuildTiming() if self.cuda_enabled else None
 
         while True:
             quant_mask, diff_thresh, run_color_diff_thresh = (
@@ -463,6 +527,14 @@ class AnsiRenderer:
             else:
                 prev_candidate = previous_frame
 
+            pre_start_event = None
+            pre_end_event = None
+            if gpu_timing is not None:
+                pre_start_event = torch.cuda.Event(enable_timing=True)
+                pre_end_event = torch.cuda.Event(enable_timing=True)
+                pre_start_event.record(
+                    torch.cuda.current_stream(device=self.config.device)
+                )
             start_pre = time.perf_counter()
             xs, ys, colors_rgb, updated_previous = pre_process_frame(
                 prev_candidate,
@@ -471,6 +543,15 @@ class AnsiRenderer:
                 quant_mask=quant_mask,
                 diff_thresh_override=diff_thresh,
             )
+            if pre_end_event is not None and pre_start_event is not None:
+                pre_end_event.record(
+                    torch.cuda.current_stream(device=self.config.device)
+                )
+                timing_ref = gpu_timing
+                if timing_ref is not None:
+                    timing_ref.preprocess_segments.append(
+                        (pre_start_event, pre_end_event)
+                    )
             preprocess_time += time.perf_counter() - start_pre
 
             if xs.numel() == 0:
@@ -484,8 +565,17 @@ class AnsiRenderer:
                     quant_mask,
                     diff_thresh,
                     0,
+                    gpu_timing,
                 )
 
+            gen_start_event = None
+            gen_end_event = None
+            if gpu_timing is not None:
+                gen_start_event = torch.cuda.Event(enable_timing=True)
+                gen_end_event = torch.cuda.Event(enable_timing=True)
+                gen_start_event.record(
+                    torch.cuda.current_stream(device=self.config.device)
+                )
             start_gen = time.perf_counter()
             ansi_gpu = ansi_generate(
                 xs,
@@ -508,6 +598,13 @@ class AnsiRenderer:
                 )
                 ansi_gpu = torch.cat([clear_seq, ansi_gpu])
 
+            if gen_end_event is not None and gen_start_event is not None:
+                gen_end_event.record(
+                    torch.cuda.current_stream(device=self.config.device)
+                )
+                timing_ref = gpu_timing
+                if timing_ref is not None:
+                    timing_ref.gen_segments.append((gen_start_event, gen_end_event))
             gen_time += time.perf_counter() - start_gen
             frame_bytes = int(ansi_gpu.size(0))
             capped_for_budget = False
@@ -551,6 +648,7 @@ class AnsiRenderer:
                 quant_mask,
                 diff_thresh,
                 frame_bytes,
+                gpu_timing,
             )
 
     def _write_all(self, fd: int, view: memoryview, chunk_size: int) -> None:
@@ -632,6 +730,7 @@ class AnsiRenderer:
             os.write(self.config.output_fd, b"\033[?1049h\033[2J\033[?25l\033[H")
             self.start_time = time.perf_counter()
             consumer_start_time = self.start_time
+            self._output_initialized = True
 
         target_time = (
             self.start_time + (frame_idx / self.config.fps) + self.config.audio_delay
@@ -645,7 +744,7 @@ class AnsiRenderer:
         sleep_time = 0.0
         if wait_time > 0:
             sleep_start = time.perf_counter()
-            time.sleep(wait_time)
+            # time.sleep(wait_time)
             sleep_time = time.perf_counter() - sleep_start
 
         pending_event = self._pending_copy_done_event
@@ -842,6 +941,7 @@ class AnsiRenderer:
                     quant_mask,
                     diff_thresh,
                     frame_bytes,
+                    _,
                 ) = self._build_frame_payload(previous_frame, frame)
 
                 if ansi_gpu is None:
@@ -923,12 +1023,15 @@ class AnsiRenderer:
             raise
 
     def __del__(self):
-        if hasattr(self, "audio_process") and self.audio_process:
-            self.audio_process.terminate()
-            self.audio_process.wait()
-        if hasattr(self, "timing_f") and self.timing_f:
-            self.timing_f.flush()
-            self.timing_f.close()
+        try:
+            if hasattr(self, "audio_process") and self.audio_process:
+                self.audio_process.terminate()
+                self.audio_process.wait()
+            if hasattr(self, "timing_f") and self.timing_f:
+                self.timing_f.flush()
+                self.timing_f.close()
 
-        if hasattr(self, "config"):
-            os.write(self.config.output_fd, b"\033[?25h\033[?1049l")
+            if hasattr(self, "config") and getattr(self, "_output_initialized", False):
+                os.write(self.config.output_fd, b"\033[?25h\033[?1049l")
+        except Exception:
+            pass

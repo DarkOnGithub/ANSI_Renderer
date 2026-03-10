@@ -1,4 +1,7 @@
 import torch
+# pyright: reportGeneralTypeIssues=false
+
+import torch
 import triton
 import triton.language as tl
 from .config import (
@@ -54,6 +57,7 @@ def ansi_run_kernel(
     COL_PREF5: tl.constexpr,
     COL_PREF6: tl.constexpr,
     SPACE: tl.constexpr,
+    MAX_RUN_LENGTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -237,7 +241,7 @@ def ansi_run_kernel(
 
         tl.store(ptr, REP_SUFFIX)
     else:
-        for i in range(0, 2048, 32):
+        for i in tl.static_range(0, MAX_RUN_LENGTH, 32):
             if i < length:
                 off = i + tl.arange(0, 32)
                 tl.store(ptr + off, SPACE, mask=off < length)
@@ -302,6 +306,7 @@ def ansi_quadrant_kernel(
     BG_PREF4: tl.constexpr,
     BG_PREF5: tl.constexpr,
     BG_PREF6: tl.constexpr,
+    MAX_RUN_LENGTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GLYPH_BLOCK_SIZE: tl.constexpr,
 ):
@@ -538,10 +543,24 @@ def ansi_quadrant_kernel(
         for i in tl.static_range(GLYPH_BLOCK_SIZE):
             if i < glyph_len:
                 byte = tl.load(glyph_bytes_base + i)
-                for j in range(0, 2048, 32):
+                for j in tl.static_range(0, MAX_RUN_LENGTH, 32):
                     if j < length:
                         off = j + tl.arange(0, 32)
                         tl.store(ptr + off * glyph_len + i, byte, mask=off < length)
+
+
+def _max_run_length_for_config(cfg: Config) -> int:
+    render_mode = str(getattr(cfg, "render_mode", "pixel")).lower()
+    width = max(1, int(cfg.width))
+
+    if render_mode == "quadrant":
+        divisor = max(1, int(getattr(cfg, "quadrant_cell_divisor", 2)))
+        width = (width + divisor - 1) // divisor
+    elif render_mode == "octant":
+        divisor = max(1, int(getattr(cfg, "octant_cell_width_divisor", 2)))
+        width = (width + divisor - 1) // divisor
+
+    return ((width + 31) // 32) * 32
 
 
 def ansi_generate(
@@ -803,6 +822,7 @@ def ansi_generate_rgb(
     out_buffer = cfg._ansi_out_buffer[:total_size_needed_val]
 
     LOOKUP_MAX_LEN = byte_vals.size(1)
+    max_run_length = _max_run_length_for_config(cfg)
     grid = (num_runs,)
     block_size = min(LOOKUP_MAX_LEN, 64)
 
@@ -854,6 +874,7 @@ def ansi_generate_rgb(
         COL_PREF_VALS[5],
         COL_PREF_VALS[6],
         32,
+        MAX_RUN_LENGTH=max_run_length,
         BLOCK_SIZE=block_size,
         num_warps=num_warps,
     )
@@ -962,8 +983,12 @@ def _build_block_runs(
             fg_diff = (fg_all[1:] != fg_all[:-1]).any(dim=1)
             bg_diff = (bg_all[1:] != bg_all[:-1]).any(dim=1)
         else:
-            fg_delta = torch.abs(fg_all[1:].to(torch.int16) - fg_all[:-1].to(torch.int16))
-            bg_delta = torch.abs(bg_all[1:].to(torch.int16) - bg_all[:-1].to(torch.int16))
+            fg_delta = torch.abs(
+                fg_all[1:].to(torch.int16) - fg_all[:-1].to(torch.int16)
+            )
+            bg_delta = torch.abs(
+                bg_all[1:].to(torch.int16) - bg_all[:-1].to(torch.int16)
+            )
             fg_diff = fg_delta.amax(dim=1) > run_color_diff_thresh
             bg_diff = bg_delta.amax(dim=1) > run_color_diff_thresh
         glyph_diff = glyph_all[1:] != glyph_all[:-1]
@@ -989,8 +1014,12 @@ def _build_block_runs(
             fg_run_diff = (run_fg[1:] != run_fg[:-1]).any(dim=1)
             bg_run_diff = (run_bg[1:] != run_bg[:-1]).any(dim=1)
         else:
-            fg_run_delta = torch.abs(run_fg[1:].to(torch.int16) - run_fg[:-1].to(torch.int16))
-            bg_run_delta = torch.abs(run_bg[1:].to(torch.int16) - run_bg[:-1].to(torch.int16))
+            fg_run_delta = torch.abs(
+                run_fg[1:].to(torch.int16) - run_fg[:-1].to(torch.int16)
+            )
+            bg_run_delta = torch.abs(
+                run_bg[1:].to(torch.int16) - run_bg[:-1].to(torch.int16)
+            )
             fg_run_diff = fg_run_delta.amax(dim=1) > run_color_diff_thresh
             bg_run_diff = bg_run_delta.amax(dim=1) > run_color_diff_thresh
         needs_style_change[1:] = fg_run_diff | bg_run_diff
@@ -1194,6 +1223,7 @@ def ansi_generate_quadrant(
 
     lookup_max_len = byte_vals.size(1)
     glyph_lookup_max_len = cfg._quadrant_lookup_bytes.size(1)
+    max_run_length = _max_run_length_for_config(cfg)
     grid = (num_runs,)
     block_size = min(lookup_max_len, 64)
 
@@ -1264,6 +1294,7 @@ def ansi_generate_quadrant(
         COL_PREF_VALS[4],
         COL_PREF_VALS[5],
         COL_PREF_VALS[6],
+        MAX_RUN_LENGTH=max_run_length,
         BLOCK_SIZE=block_size,
         GLYPH_BLOCK_SIZE=glyph_lookup_max_len,
         num_warps=num_warps,
@@ -1461,6 +1492,7 @@ def ansi_generate_octant(
 
     lookup_max_len = byte_vals.size(1)
     glyph_lookup_max_len = cfg._octant_lookup_bytes.size(1)
+    max_run_length = _max_run_length_for_config(cfg)
     grid = (num_runs,)
     block_size = min(lookup_max_len, 64)
 
@@ -1531,6 +1563,7 @@ def ansi_generate_octant(
         COL_PREF_VALS[4],
         COL_PREF_VALS[5],
         COL_PREF_VALS[6],
+        MAX_RUN_LENGTH=max_run_length,
         BLOCK_SIZE=block_size,
         GLYPH_BLOCK_SIZE=glyph_lookup_max_len,
         num_warps=num_warps,
