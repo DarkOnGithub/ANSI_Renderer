@@ -252,11 +252,13 @@ def ansi_quadrant_kernel(
     run_bg_g_ptr,
     run_bg_b_ptr,
     glyph_idx_ptr,
+    run_lengths_ptr,
     offsets_ptr,
     move_kind_ptr,
     move_v_ptr,
     move_h_ptr,
     needs_style_change_ptr,
+    use_rep_run_ptr,
     num_lookup_bytes_ptr,
     num_lookup_lens_ptr,
     fg_r_lookup_bytes_ptr,
@@ -285,6 +287,7 @@ def ansi_quadrant_kernel(
     CUR_DOWN: tl.constexpr,
     CUR_RIGHT: tl.constexpr,
     CUR_LEFT: tl.constexpr,
+    REP_SUFFIX: tl.constexpr,
     FG_PREF0: tl.constexpr,
     FG_PREF1: tl.constexpr,
     FG_PREF2: tl.constexpr,
@@ -313,11 +316,13 @@ def ansi_quadrant_kernel(
     bg_g_val = tl.load(run_bg_g_ptr + pid)
     bg_b_val = tl.load(run_bg_b_ptr + pid)
     glyph_idx = tl.load(glyph_idx_ptr + pid)
+    length = tl.load(run_lengths_ptr + pid)
     offset = tl.load(offsets_ptr + pid)
     move_kind = tl.load(move_kind_ptr + pid)
     move_v = tl.load(move_v_ptr + pid)
     move_h = tl.load(move_h_ptr + pid)
     needs_style_change = tl.load(needs_style_change_ptr + pid)
+    use_rep_run = tl.load(use_rep_run_ptr + pid)
 
     ptr = out_ptr + offset
 
@@ -507,10 +512,36 @@ def ansi_quadrant_kernel(
 
     glyph_len = tl.load(glyph_lookup_lens_ptr + glyph_idx)
     glyph_bytes_base = glyph_lookup_bytes_ptr + glyph_idx * GLYPH_BLOCK_SIZE
-    for i in tl.static_range(GLYPH_BLOCK_SIZE):
-        if i < glyph_len:
-            byte = tl.load(glyph_bytes_base + i)
-            tl.store(ptr + i, byte)
+    if use_rep_run:
+        for i in tl.static_range(GLYPH_BLOCK_SIZE):
+            if i < glyph_len:
+                byte = tl.load(glyph_bytes_base + i)
+                tl.store(ptr + i, byte)
+        ptr += glyph_len
+
+        tl.store(ptr, ESC0)
+        ptr += 1
+        tl.store(ptr, ESC1)
+        ptr += 1
+
+        rep_count = length - 1
+        rep_len = tl.load(num_lookup_lens_ptr + rep_count)
+        rep_bytes_base = num_lookup_bytes_ptr + rep_count * BLOCK_SIZE
+        for i in tl.static_range(BLOCK_SIZE):
+            if i < rep_len:
+                byte = tl.load(rep_bytes_base + i)
+                tl.store(ptr + i, byte)
+        ptr += rep_len
+
+        tl.store(ptr, REP_SUFFIX)
+    else:
+        for i in tl.static_range(GLYPH_BLOCK_SIZE):
+            if i < glyph_len:
+                byte = tl.load(glyph_bytes_base + i)
+                for j in range(0, 2048, 32):
+                    if j < length:
+                        off = j + tl.arange(0, 32)
+                        tl.store(ptr + off * glyph_len + i, byte, mask=off < length)
 
 
 def ansi_generate(
@@ -899,6 +930,83 @@ def _ensure_octant_lookup(cfg: Config, device: torch.device) -> None:
     cfg._octant_lookup_device = device
 
 
+def _build_block_runs(
+    xs_sorted: torch.Tensor,
+    ys_sorted: torch.Tensor,
+    styles_sorted: torch.Tensor,
+    run_color_diff_thresh: int,
+) -> tuple[
+    int,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    device = xs_sorted.device
+    n = xs_sorted.numel()
+
+    fg_all = styles_sorted[:, 0:3]
+    bg_all = styles_sorted[:, 3:6]
+    glyph_all = styles_sorted[:, 6].to(torch.int64)
+
+    is_new_run = torch.zeros(n, dtype=torch.bool, device=device)
+    is_new_run[0] = True
+
+    if n > 1:
+        y_diff = ys_sorted[1:] != ys_sorted[:-1]
+        x_diff = xs_sorted[1:] - xs_sorted[:-1]
+        if run_color_diff_thresh <= 0:
+            fg_diff = (fg_all[1:] != fg_all[:-1]).any(dim=1)
+            bg_diff = (bg_all[1:] != bg_all[:-1]).any(dim=1)
+        else:
+            fg_delta = torch.abs(fg_all[1:].to(torch.int16) - fg_all[:-1].to(torch.int16))
+            bg_delta = torch.abs(bg_all[1:].to(torch.int16) - bg_all[:-1].to(torch.int16))
+            fg_diff = fg_delta.amax(dim=1) > run_color_diff_thresh
+            bg_diff = bg_delta.amax(dim=1) > run_color_diff_thresh
+        glyph_diff = glyph_all[1:] != glyph_all[:-1]
+        is_new_run[1:] = y_diff | (x_diff != 1) | fg_diff | bg_diff | glyph_diff
+
+    run_start_indices = torch.where(is_new_run)[0]
+    num_runs = int(run_start_indices.size(0))
+
+    run_lengths = torch.empty(num_runs, dtype=torch.int64, device=device)
+    if num_runs > 1:
+        run_lengths[:-1] = run_start_indices[1:] - run_start_indices[:-1]
+    run_lengths[-1] = n - run_start_indices[-1]
+
+    run_xs = xs_sorted[run_start_indices]
+    run_ys = ys_sorted[run_start_indices]
+    run_fg = fg_all[run_start_indices]
+    run_bg = bg_all[run_start_indices]
+    run_glyph_idx = glyph_all[run_start_indices]
+
+    needs_style_change = torch.ones(num_runs, dtype=torch.bool, device=device)
+    if num_runs > 1:
+        if run_color_diff_thresh <= 0:
+            fg_run_diff = (run_fg[1:] != run_fg[:-1]).any(dim=1)
+            bg_run_diff = (run_bg[1:] != run_bg[:-1]).any(dim=1)
+        else:
+            fg_run_delta = torch.abs(run_fg[1:].to(torch.int16) - run_fg[:-1].to(torch.int16))
+            bg_run_delta = torch.abs(run_bg[1:].to(torch.int16) - run_bg[:-1].to(torch.int16))
+            fg_run_diff = fg_run_delta.amax(dim=1) > run_color_diff_thresh
+            bg_run_diff = bg_run_delta.amax(dim=1) > run_color_diff_thresh
+        needs_style_change[1:] = fg_run_diff | bg_run_diff
+
+    return (
+        num_runs,
+        run_lengths,
+        run_xs,
+        run_ys,
+        run_fg,
+        run_bg,
+        run_glyph_idx,
+        needs_style_change,
+    )
+
+
 def ansi_generate_quadrant(
     xs: torch.Tensor,
     ys: torch.Tensor,
@@ -920,20 +1028,6 @@ def ansi_generate_quadrant(
     ys_sorted = ys
     styles_sorted = styles
 
-    num_runs = N
-    run_xs = xs_sorted
-    run_ys = ys_sorted
-
-    run_fg = styles_sorted[:, 0:3]
-    run_bg = styles_sorted[:, 3:6]
-    run_glyph_idx = styles_sorted[:, 6].to(torch.int64)
-
-    needs_move = torch.ones(num_runs, dtype=torch.bool, device=device)
-    if num_runs > 1:
-        same_row = run_ys[1:] == run_ys[:-1]
-        continuous_x = run_xs[1:] == (run_xs[:-1] + 1)
-        needs_move[1:] = ~(same_row & continuous_x)
-
     run_color_diff_thresh = max(
         0,
         int(
@@ -942,22 +1036,22 @@ def ansi_generate_quadrant(
             else run_color_diff_thresh_override
         ),
     )
-    needs_style_change = torch.ones(num_runs, dtype=torch.bool, device=device)
+    (
+        num_runs,
+        run_lengths,
+        run_xs,
+        run_ys,
+        run_fg,
+        run_bg,
+        run_glyph_idx,
+        needs_style_change,
+    ) = _build_block_runs(xs_sorted, ys_sorted, styles_sorted, run_color_diff_thresh)
+
+    needs_move = torch.ones(num_runs, dtype=torch.bool, device=device)
     if num_runs > 1:
-        if run_color_diff_thresh <= 0:
-            fg_diff = (run_fg[1:] != run_fg[:-1]).any(dim=1)
-            bg_diff = (run_bg[1:] != run_bg[:-1]).any(dim=1)
-        else:
-            fg_delta = torch.abs(
-                run_fg[1:].to(torch.int16) - run_fg[:-1].to(torch.int16)
-            )
-            bg_delta = torch.abs(
-                run_bg[1:].to(torch.int16) - run_bg[:-1].to(torch.int16)
-            )
-            fg_diff = fg_delta.amax(dim=1) > run_color_diff_thresh
-            bg_diff = bg_delta.amax(dim=1) > run_color_diff_thresh
-        glyph_diff = run_glyph_idx[1:] != run_glyph_idx[:-1]
-        needs_style_change[1:] = fg_diff | bg_diff | glyph_diff
+        same_row = run_ys[1:] == run_ys[:-1]
+        continuous_x = run_xs[1:] == (run_xs[:-1] + run_lengths[:-1])
+        needs_move[1:] = ~(same_row & continuous_x)
 
     run_fg_r = run_fg[:, 0].to(torch.int64)
     run_fg_g = run_fg[:, 1].to(torch.int64)
@@ -994,7 +1088,7 @@ def ansi_generate_quadrant(
 
         if bool(getattr(cfg, "relative_cursor_moves", True)):
             prev_rows = run_ys[move_indices - 1]
-            prev_cols_after = run_xs[move_indices - 1] + 1
+            prev_cols_after = run_xs[move_indices - 1] + run_lengths[move_indices - 1]
             dy = run_ys[move_indices] - prev_rows
             dx = run_xs[move_indices] - prev_cols_after
 
@@ -1067,7 +1161,18 @@ def ansi_generate_quadrant(
     style_part = (fg_len_full + bg_len_full) * needs_style_change.to(torch.int64)
 
     glyph_lens = cfg._quadrant_lookup_lens[run_glyph_idx].to(torch.int64)
-    payload_lens = glyph_lens
+    use_rep = bool(getattr(cfg, "use_rep", False))
+    rep_min_run = max(2, int(getattr(cfg, "rep_min_run", 12)))
+    if use_rep:
+        use_rep_run = run_lengths >= rep_min_run
+        rep_counts = (run_lengths - 1).clamp_min(0).to(torch.long)
+        rep_count_lens = byte_lens[rep_counts].to(torch.int64)
+        payload_lens = torch.where(
+            use_rep_run, glyph_lens + 2 + rep_count_lens + 1, glyph_lens * run_lengths
+        )
+    else:
+        use_rep_run = torch.zeros(num_runs, dtype=torch.bool, device=device)
+        payload_lens = glyph_lens * run_lengths
 
     total_lens = move_lens + style_part + payload_lens
 
@@ -1109,11 +1214,13 @@ def ansi_generate_quadrant(
         run_bg_g,
         run_bg_b,
         run_glyph_idx,
+        run_lengths,
         offsets,
         move_kind,
         move_v,
         move_h,
         needs_style_change,
+        use_rep_run,
         byte_vals,
         byte_lens,
         byte_vals,
@@ -1142,6 +1249,7 @@ def ansi_generate_quadrant(
         66,
         67,
         68,
+        98,
         FG_COL_PREF_VALS[0],
         FG_COL_PREF_VALS[1],
         FG_COL_PREF_VALS[2],
@@ -1187,20 +1295,6 @@ def ansi_generate_octant(
     ys_sorted = ys
     styles_sorted = styles
 
-    num_runs = N
-    run_xs = xs_sorted
-    run_ys = ys_sorted
-
-    run_fg = styles_sorted[:, 0:3]
-    run_bg = styles_sorted[:, 3:6]
-    run_glyph_idx = styles_sorted[:, 6].to(torch.int64)
-
-    needs_move = torch.ones(num_runs, dtype=torch.bool, device=device)
-    if num_runs > 1:
-        same_row = run_ys[1:] == run_ys[:-1]
-        continuous_x = run_xs[1:] == (run_xs[:-1] + 1)
-        needs_move[1:] = ~(same_row & continuous_x)
-
     run_color_diff_thresh = max(
         0,
         int(
@@ -1209,22 +1303,22 @@ def ansi_generate_octant(
             else run_color_diff_thresh_override
         ),
     )
-    needs_style_change = torch.ones(num_runs, dtype=torch.bool, device=device)
+    (
+        num_runs,
+        run_lengths,
+        run_xs,
+        run_ys,
+        run_fg,
+        run_bg,
+        run_glyph_idx,
+        needs_style_change,
+    ) = _build_block_runs(xs_sorted, ys_sorted, styles_sorted, run_color_diff_thresh)
+
+    needs_move = torch.ones(num_runs, dtype=torch.bool, device=device)
     if num_runs > 1:
-        if run_color_diff_thresh <= 0:
-            fg_diff = (run_fg[1:] != run_fg[:-1]).any(dim=1)
-            bg_diff = (run_bg[1:] != run_bg[:-1]).any(dim=1)
-        else:
-            fg_delta = torch.abs(
-                run_fg[1:].to(torch.int16) - run_fg[:-1].to(torch.int16)
-            )
-            bg_delta = torch.abs(
-                run_bg[1:].to(torch.int16) - run_bg[:-1].to(torch.int16)
-            )
-            fg_diff = fg_delta.amax(dim=1) > run_color_diff_thresh
-            bg_diff = bg_delta.amax(dim=1) > run_color_diff_thresh
-        glyph_diff = run_glyph_idx[1:] != run_glyph_idx[:-1]
-        needs_style_change[1:] = fg_diff | bg_diff | glyph_diff
+        same_row = run_ys[1:] == run_ys[:-1]
+        continuous_x = run_xs[1:] == (run_xs[:-1] + run_lengths[:-1])
+        needs_move[1:] = ~(same_row & continuous_x)
 
     run_fg_r = run_fg[:, 0].to(torch.int64)
     run_fg_g = run_fg[:, 1].to(torch.int64)
@@ -1261,7 +1355,7 @@ def ansi_generate_octant(
 
         if bool(getattr(cfg, "relative_cursor_moves", True)):
             prev_rows = run_ys[move_indices - 1]
-            prev_cols_after = run_xs[move_indices - 1] + 1
+            prev_cols_after = run_xs[move_indices - 1] + run_lengths[move_indices - 1]
             dy = run_ys[move_indices] - prev_rows
             dx = run_xs[move_indices] - prev_cols_after
 
@@ -1334,7 +1428,18 @@ def ansi_generate_octant(
     style_part = (fg_len_full + bg_len_full) * needs_style_change.to(torch.int64)
 
     glyph_lens = cfg._octant_lookup_lens[run_glyph_idx].to(torch.int64)
-    payload_lens = glyph_lens
+    use_rep = bool(getattr(cfg, "use_rep", False))
+    rep_min_run = max(2, int(getattr(cfg, "rep_min_run", 12)))
+    if use_rep:
+        use_rep_run = run_lengths >= rep_min_run
+        rep_counts = (run_lengths - 1).clamp_min(0).to(torch.long)
+        rep_count_lens = byte_lens[rep_counts].to(torch.int64)
+        payload_lens = torch.where(
+            use_rep_run, glyph_lens + 2 + rep_count_lens + 1, glyph_lens * run_lengths
+        )
+    else:
+        use_rep_run = torch.zeros(num_runs, dtype=torch.bool, device=device)
+        payload_lens = glyph_lens * run_lengths
 
     total_lens = move_lens + style_part + payload_lens
 
@@ -1376,11 +1481,13 @@ def ansi_generate_octant(
         run_bg_g,
         run_bg_b,
         run_glyph_idx,
+        run_lengths,
         offsets,
         move_kind,
         move_v,
         move_h,
         needs_style_change,
+        use_rep_run,
         byte_vals,
         byte_lens,
         byte_vals,
@@ -1409,6 +1516,7 @@ def ansi_generate_octant(
         66,
         67,
         68,
+        98,
         FG_COL_PREF_VALS[0],
         FG_COL_PREF_VALS[1],
         FG_COL_PREF_VALS[2],

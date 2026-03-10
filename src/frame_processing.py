@@ -1,6 +1,7 @@
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from .config import Config
 from .glyph_tables import OCTANT_GLYPH_SWAP
@@ -40,9 +41,7 @@ def _get_quadrant_masks(device: torch.device) -> torch.Tensor:
 def _get_octant_swap_flags(device: torch.device) -> torch.Tensor:
     swap_flags = _octant_swap_cache.get(device)
     if swap_flags is None:
-        swap_flags = torch.tensor(
-            OCTANT_GLYPH_SWAP, dtype=torch.bool, device=device
-        )
+        swap_flags = torch.tensor(OCTANT_GLYPH_SWAP, dtype=torch.bool, device=device)
         _octant_swap_cache[device] = swap_flags
     return swap_flags
 
@@ -114,9 +113,7 @@ def _encode_octant_cells(frame: torch.Tensor) -> torch.Tensor:
     cells = pixels.view(-1, 8, 3)
     device = frame.device
 
-    luminance = (
-        0.299 * cells[:, :, 0] + 0.587 * cells[:, :, 1] + 0.114 * cells[:, :, 2]
-    )
+    luminance = 0.299 * cells[:, :, 0] + 0.587 * cells[:, :, 1] + 0.114 * cells[:, :, 2]
     min_vals = luminance.argmin(dim=1)
     max_vals = luminance.argmax(dim=1)
     cell_indices = torch.arange(cells.size(0), device=device)
@@ -184,6 +181,28 @@ def _encode_octant_cells(frame: torch.Tensor) -> torch.Tensor:
     return styles.view(height, width, 7)
 
 
+def _set_block_source_cache(
+    config: Config, render_mode: str, frame: torch.Tensor
+) -> None:
+    cached = getattr(config, "_block_source_cache_frame", None)
+    if cached is None or cached.shape != frame.shape or cached.device != frame.device:
+        setattr(config, "_block_source_cache_frame", frame.clone())
+    else:
+        cached.copy_(frame)
+    setattr(config, "_block_source_cache_mode", render_mode)
+
+
+def _empty_block_update(
+    previous_frame: torch.Tensor, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty(0, device=device, dtype=torch.int64),
+        torch.empty(0, device=device, dtype=torch.int64),
+        torch.empty((0, 7), device=device, dtype=torch.uint8),
+        previous_frame,
+    )
+
+
 def pre_process_frame(
     previous_frame: Optional[torch.Tensor],
     frame: torch.Tensor,
@@ -224,17 +243,69 @@ def pre_process_frame(
 
     if render_mode in ("quadrant", "octant"):
         if render_mode == "quadrant":
-            cell_styles = _encode_quadrant_cells(resized_frame)
+            encode_cells = _encode_quadrant_cells
+            source_cell_height = 2
+            source_cell_width = 2
         else:
-            cell_styles = _encode_octant_cells(resized_frame)
-        device = cell_styles.device
+            encode_cells = _encode_octant_cells
+            source_cell_height = 4
+            source_cell_width = 2
 
-        if previous_frame is None or previous_frame.shape != cell_styles.shape:
+        device = resized_frame.device
+        cell_shape = (
+            (resized_frame.shape[0] + source_cell_height - 1) // source_cell_height,
+            (resized_frame.shape[1] + source_cell_width - 1) // source_cell_width,
+            7,
+        )
+        cached_source = getattr(config, "_block_source_cache_frame", None)
+        cache_matches = (
+            cached_source is not None
+            and getattr(config, "_block_source_cache_mode", None) == render_mode
+            and cached_source.shape == resized_frame.shape
+            and cached_source.device == resized_frame.device
+        )
+
+        if (
+            previous_frame is None
+            or previous_frame.shape != cell_shape
+            or not cache_matches
+        ):
+            cell_styles = encode_cells(resized_frame)
+            _set_block_source_cache(config, render_mode, resized_frame)
             height, width = cell_styles.shape[:2]
             ys = torch.arange(height, device=device).repeat_interleave(width)
             xs = torch.arange(width, device=device).repeat(height)
             styles = cell_styles[ys, xs]
             return xs, ys, styles, cell_styles
+
+        source_diff = (resized_frame != cached_source).any(dim=-1)
+        if not source_diff.any():
+            return _empty_block_update(previous_frame, device)
+
+        dirty_cell_mask = (
+            F.max_pool2d(
+                source_diff.to(torch.float32).unsqueeze(0).unsqueeze(0),
+                kernel_size=(source_cell_height, source_cell_width),
+                stride=(source_cell_height, source_cell_width),
+                ceil_mode=True,
+            )
+            .squeeze(0)
+            .squeeze(0)
+            .to(torch.bool)
+        )
+        dirty_cell_ys, dirty_cell_xs = dirty_cell_mask.nonzero(as_tuple=True)
+        cell_y0 = int(dirty_cell_ys.min().item())
+        cell_y1 = int(dirty_cell_ys.max().item()) + 1
+        cell_x0 = int(dirty_cell_xs.min().item())
+        cell_x1 = int(dirty_cell_xs.max().item()) + 1
+
+        src_y0 = cell_y0 * source_cell_height
+        src_y1 = min(cell_y1 * source_cell_height, resized_frame.shape[0])
+        src_x0 = cell_x0 * source_cell_width
+        src_x1 = min(cell_x1 * source_cell_width, resized_frame.shape[1])
+
+        cell_styles = encode_cells(resized_frame[src_y0:src_y1, src_x0:src_x1])
+        previous_slice = previous_frame[cell_y0:cell_y1, cell_x0:cell_x1]
 
         diff_thresh = (
             config.diff_thresh
@@ -242,29 +313,25 @@ def pre_process_frame(
             else int(diff_thresh_override)
         )
 
-        glyph_diff = cell_styles[..., 6] != previous_frame[..., 6]
+        glyph_diff = cell_styles[..., 6] != previous_slice[..., 6]
         if diff_thresh <= 0:
-            color_diff = (cell_styles[..., :6] != previous_frame[..., :6]).any(dim=-1)
+            color_diff = (cell_styles[..., :6] != previous_slice[..., :6]).any(dim=-1)
         else:
-            color_diff = (
-                torch.abs(
-                    cell_styles[..., :6].to(torch.int16)
-                    - previous_frame[..., :6].to(torch.int16)
-                ).amax(dim=-1)
-                > int(diff_thresh)
-            )
+            color_diff = torch.abs(
+                cell_styles[..., :6].to(torch.int16)
+                - previous_slice[..., :6].to(torch.int16)
+            ).amax(dim=-1) > int(diff_thresh)
         diff_mask = glyph_diff | color_diff
 
+        _set_block_source_cache(config, render_mode, resized_frame)
+
         if not diff_mask.any():
-            return (
-                torch.empty(0, device=device, dtype=torch.int64),
-                torch.empty(0, device=device, dtype=torch.int64),
-                torch.empty((0, 7), device=device, dtype=torch.uint8),
-                previous_frame,
-            )
+            return _empty_block_update(previous_frame, device)
 
         ys, xs = diff_mask.nonzero(as_tuple=True)
-        styles = cell_styles[ys, xs]
+        ys = ys + cell_y0
+        xs = xs + cell_x0
+        styles = cell_styles[ys - cell_y0, xs - cell_x0]
         previous_frame[ys, xs] = styles
         return xs, ys, styles, previous_frame
 

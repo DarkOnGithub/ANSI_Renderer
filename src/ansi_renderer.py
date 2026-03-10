@@ -83,7 +83,7 @@ class AnsiRenderer:
         if self.config.timing_enabled:
             self.timing_f = open(self.config.timing_file, "w")
             self.timing_f.write(
-                "frame_idx,gen_time,fetch_time,preprocess_time,render_time,total_time,sleep_time,end_to_end_time,datasize,quality_level,quant_mask,diff_thresh\n"
+                "frame_idx,gen_time,fetch_time,preprocess_time,producer_time,queue_wait_time,copy_wait_time,render_time,consumer_time,pipeline_time,total_time,sleep_time,end_to_end_time,datasize,quality_level,quant_mask,diff_thresh,frame_start_time,frame_end_time\n"
             )
             self.frame_idx = 0
             self._timing_rows_since_flush = 0
@@ -612,6 +612,7 @@ class AnsiRenderer:
         if frame is None:
             return
 
+        consumer_start_time = time.perf_counter()
         if self.start_time is None:
             if self.config.audio_path:
                 self.audio_process = subprocess.Popen(
@@ -630,6 +631,7 @@ class AnsiRenderer:
                 )
             os.write(self.config.output_fd, b"\033[?1049h\033[2J\033[?25l\033[H")
             self.start_time = time.perf_counter()
+            consumer_start_time = self.start_time
 
         target_time = (
             self.start_time + (frame_idx / self.config.fps) + self.config.audio_delay
@@ -647,8 +649,11 @@ class AnsiRenderer:
             sleep_time = time.perf_counter() - sleep_start
 
         pending_event = self._pending_copy_done_event
+        copy_wait_time = 0.0
         if pending_event is not None:
+            copy_wait_start = time.perf_counter()
             pending_event.synchronize()
+            copy_wait_time = time.perf_counter() - copy_wait_start
             self._pending_copy_done_event = None
 
         start_render = time.perf_counter()
@@ -706,16 +711,24 @@ class AnsiRenderer:
             gen_time = getattr(self, "_last_gen_time", 0.0)
             fetch_time = getattr(self, "_last_fetch_time", 0.0)
             preprocess_time = getattr(self, "_last_preprocess_time", 0.0)
+            queue_wait_time = getattr(self, "_last_queue_wait_time", 0.0)
             quality_level = getattr(self, "_last_quality_level", 0)
             quant_mask = getattr(self, "_last_quant_mask", int(self.config.quant_mask))
             diff_thresh = getattr(
                 self, "_last_diff_thresh", int(self.config.diff_thresh)
             )
 
-            total_time = gen_time + fetch_time + preprocess_time + render_time
-            end_to_end_time = total_time + sleep_time
+            producer_time = fetch_time + preprocess_time + gen_time
+            consumer_time = copy_wait_time + render_time
+            pipeline_time = max(producer_time, consumer_time)
+            total_time = pipeline_time
+            end_to_end_time = queue_wait_time + sleep_time + consumer_time
+            frame_start_time = max(0.0, consumer_start_time - self.start_time)
+            frame_end_time = max(
+                frame_start_time, time.perf_counter() - self.start_time
+            )
             timing_f.write(
-                f"{self.frame_idx},{gen_time:.6f},{fetch_time:.6f},{preprocess_time:.6f},{render_time:.6f},{total_time:.6f},{sleep_time:.6f},{end_to_end_time:.6f},{datasize},{quality_level},{quant_mask},{diff_thresh}\n"
+                f"{self.frame_idx},{gen_time:.6f},{fetch_time:.6f},{preprocess_time:.6f},{producer_time:.6f},{queue_wait_time:.6f},{copy_wait_time:.6f},{render_time:.6f},{consumer_time:.6f},{pipeline_time:.6f},{total_time:.6f},{sleep_time:.6f},{end_to_end_time:.6f},{datasize},{quality_level},{quant_mask},{diff_thresh},{frame_start_time:.6f},{frame_end_time:.6f}\n"
             )
             self.frame_idx += 1
             self._timing_rows_since_flush += 1
@@ -734,10 +747,21 @@ class AnsiRenderer:
                     raise RuntimeError(
                         "Generator thread crashed without exception details"
                     )
-            try:
-                item = self.ansi_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
+            queue_wait_time = 0.0
+            while True:
+                wait_start = time.perf_counter()
+                try:
+                    item = self.ansi_queue.get(timeout=0.1)
+                    queue_wait_time += time.perf_counter() - wait_start
+                    break
+                except queue.Empty:
+                    queue_wait_time += time.perf_counter() - wait_start
+                    if self.thread_crashed.is_set():
+                        if self.thread_exception:
+                            raise self.thread_exception
+                        raise RuntimeError(
+                            "Generator thread crashed without exception details"
+                        )
             if item is None:
                 break
 
@@ -757,6 +781,7 @@ class AnsiRenderer:
                 self._last_gen_time = gen_time
                 self._last_fetch_time = fetch_time
                 self._last_preprocess_time = preprocess_time
+                self._last_queue_wait_time = queue_wait_time
                 self._last_quality_level = quality_level
                 self._last_quant_mask = quant_mask
                 self._last_diff_thresh = diff_thresh
