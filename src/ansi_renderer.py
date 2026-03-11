@@ -1,4 +1,3 @@
-import os
 import queue
 import os
 import subprocess
@@ -731,15 +730,6 @@ class AnsiRenderer:
             self.start_time = time.perf_counter()
             consumer_start_time = self.start_time
             self._output_initialized = True
-
-        target_time = (
-            self.start_time + (frame_idx / self.config.fps) + self.config.audio_delay
-        )
-        now = time.perf_counter()
-        lead = 0.0
-        if self.config.pacing_render_lead and self._render_time_ema > 0.0:
-            lead = self._render_time_ema
-        wait_time = target_time - now - lead
 
         sleep_time = 0.0
         # if wait_time > 0:

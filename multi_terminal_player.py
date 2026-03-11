@@ -1,20 +1,16 @@
 import argparse
-import argparse
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import json
 import os
-import queue
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Generator
+from typing import Generator, Sequence
 
 import numpy as np
 import torch
@@ -34,6 +30,12 @@ from src.config import (
     Config,
 )
 from src.frame_processing import pre_process_frame
+from src.video_playback import (
+    LatestFrameReader,
+    playback_target_time,
+    probe_video_stream,
+    should_drop_frame,
+)
 
 PANE_ORDER = ("top_left", "top_right", "bottom_left", "bottom_right")
 INIT_SEQUENCE = ENABLE_ALT_BUFFER + CLEAR_SCREEN + HIDE_CURSOR + b"\033[H"
@@ -216,128 +218,7 @@ class RuntimeStats:
 _FLUSH_EXECUTOR: ThreadPoolExecutor | None = None
 
 
-@dataclass
-class DecodedFrame:
-    frame_idx: int
-    frame_np: np.ndarray
-
-
-class LatestFrameReader:
-    def __init__(
-        self,
-        path: str,
-        width: int,
-        height: int,
-        *,
-        output_width: int | None = None,
-        output_height: int | None = None,
-        vf: str | None = None,
-    ):
-        self.width = width
-        self.height = height
-        self.output_width = int(output_width) if output_width is not None else width
-        self.output_height = int(output_height) if output_height is not None else height
-        self.frame_bytes = self.output_width * self.output_height * 3
-        self.queue: queue.Queue[DecodedFrame | None] = queue.Queue(maxsize=2)
-        self.stop_event = threading.Event()
-        self.done = False
-        self.error: Exception | None = None
-        cmd = [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-i",
-            path,
-        ]
-        if vf:
-            cmd.extend(["-vf", vf])
-        cmd.extend(
-            [
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgb24",
-                "-",
-            ]
-        )
-        self.proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self.thread.start()
-
-    def _put_latest(self, item: DecodedFrame | None) -> None:
-        while not self.stop_event.is_set():
-            try:
-                self.queue.put(item, timeout=0.05)
-                return
-            except queue.Full:
-                try:
-                    self.queue.get_nowait()
-                except queue.Empty:
-                    pass
-
-    def _reader_loop(self) -> None:
-        frame_idx = 0
-        try:
-            if self.proc.stdout is None:
-                return
-            while not self.stop_event.is_set():
-                raw = self.proc.stdout.read(self.frame_bytes)
-                if not raw or len(raw) < self.frame_bytes:
-                    break
-                frame_np = (
-                    np.frombuffer(raw, dtype=np.uint8)
-                    .reshape(self.output_height, self.output_width, 3)
-                    .copy()
-                )
-                self._put_latest(DecodedFrame(frame_idx=frame_idx, frame_np=frame_np))
-                frame_idx += 1
-        except Exception as exc:
-            self.error = exc
-        finally:
-            self.done = True
-            self._put_latest(None)
-
-    def get(self, timeout: float = 0.1) -> tuple[int, np.ndarray] | None:
-        while True:
-            if self.error is not None:
-                raise self.error
-            try:
-                item = self.queue.get(timeout=timeout)
-            except queue.Empty:
-                if self.done:
-                    return None
-                continue
-            if item is None:
-                return None
-            return item.frame_idx, item.frame_np
-
-    def close(self) -> None:
-        self.stop_event.set()
-        try:
-            if self.proc.stdout is not None:
-                self.proc.stdout.close()
-        except Exception:
-            pass
-        try:
-            if self.proc.stderr is not None:
-                self.proc.stderr.close()
-        except Exception:
-            pass
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait()
-        self.thread.join(timeout=1)
-
-
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render one video across four tiled Alacritty terminals."
     )
@@ -430,7 +311,7 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Drop frames when video falls behind audio by more than this many frames",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def require_cmd(name: str) -> None:
@@ -440,31 +321,6 @@ def require_cmd(name: str) -> None:
 
 def resolve_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
-
-
-def probe_video_stream(path: str) -> tuple[int, int, float]:
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=width,height,avg_frame_rate",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        path,
-    ]
-    out = subprocess.check_output(cmd, text=True).strip().splitlines()
-    width = int(out[0])
-    height = int(out[1])
-    rate_text = out[2]
-    if "/" in rate_text:
-        num, den = rate_text.split("/", 1)
-        fps = float(num) / max(float(den), 1.0)
-    else:
-        fps = float(rate_text)
-    return width, height, fps
 
 
 def compute_fit_geometry(
@@ -517,41 +373,6 @@ def build_ffmpeg_canvas_filter(
     if new_width != target_width or new_height != target_height:
         filters.append(f"pad={target_width}:{target_height}:{left}:{top}:color=black")
     return ",".join(filters)
-
-
-def rawvideo_frame_generator(
-    path: str, width: int, height: int, device: torch.device
-) -> Generator[torch.Tensor, None, None]:
-    frame_bytes = width * height * 3
-    cmd = [
-        "ffmpeg",
-        "-v",
-        "error",
-        "-i",
-        path,
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-",
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        if proc.stdout is None:
-            return
-        while True:
-            raw = proc.stdout.read(frame_bytes)
-            if not raw or len(raw) < frame_bytes:
-                break
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy()
-            yield torch.from_numpy(frame).to(device)
-    finally:
-        if proc.stdout is not None:
-            proc.stdout.close()
-        if proc.stderr is not None:
-            proc.stderr.close()
-        proc.terminate()
-        proc.wait()
 
 
 def wait_for_session_file(session_dir: str, timeout: float = 10.0) -> str:
@@ -800,13 +621,13 @@ def build_configured_renderer(
         height=height,
         device=device,
         fps=fps,
-        render_mode="quadrant",
-        quadrant_cell_divisor=2,
-        octant_cell_width_divisor=2,
-        octant_cell_height_divisor=4,
-        quant_mask=0xFC,
-        diff_thresh=4,
-        run_color_diff_thresh=4,
+        render_mode=str(args.render_mode),
+        quadrant_cell_divisor=int(args.quadrant_cell_divisor),
+        octant_cell_width_divisor=int(args.octant_cell_width_divisor),
+        octant_cell_height_divisor=int(args.octant_cell_height_divisor),
+        quant_mask=0xFF,
+        diff_thresh=int(args.diff_thresh),
+        run_color_diff_thresh=int(args.run_color_diff_thresh),
         adaptive_quality=False,
         adaptive_quant_masks=(0xFF,),
         adaptive_diff_thresh_offsets=(0,),
@@ -815,7 +636,7 @@ def build_configured_renderer(
         target_frame_bytes=0,
         frame_byte_buffer_frames=8,
         max_frame_bytes=0,
-        relative_cursor_moves=False,
+        relative_cursor_moves=str(args.cursor_moves).lower() == "relative",
         use_rep=True,
         rep_min_run=12,
         sync_output=False,
@@ -1047,14 +868,6 @@ def shared_gpu_preprocess_time(timing: GpuBuildTiming | None) -> float:
         return 0.0
     timing.synchronize()
     return timing.preprocess_ms() / 1000.0
-
-
-def build_pane_payloads(
-    panes: list[PaneRuntime],
-    canvas: torch.Tensor,
-) -> list[PanePayload]:
-    payloads, _, _ = build_pane_payloads_with_stats(panes, canvas)
-    return payloads
 
 
 def build_pane_payloads_with_stats(
@@ -1650,31 +1463,6 @@ def draw_fps_overlay(frame: np.ndarray, text: str) -> None:
     frame[y0:y1, x0:x1] = overlay.astype(frame.dtype, copy=False)
 
 
-def should_drop_frame(
-    now: float,
-    start_time: float,
-    playback_frame_idx: int,
-    fps: float,
-    audio_delay: float,
-    max_frame_lag: float,
-    lead_time: float = 0.0,
-) -> bool:
-    frame_interval = 1.0 / max(fps, 1e-6)
-    target_time = start_time + (playback_frame_idx * frame_interval) + audio_delay
-    allowed_lateness = max(0.0, max_frame_lag) * frame_interval
-    return (now + max(0.0, lead_time)) > target_time + allowed_lateness
-
-
-def playback_target_time(
-    start_time: float,
-    playback_frame_idx: int,
-    fps: float,
-    audio_delay: float,
-) -> float:
-    frame_interval = 1.0 / max(fps, 1e-6)
-    return start_time + (max(0, int(playback_frame_idx)) * frame_interval) + audio_delay
-
-
 def open_panes(
     specs: list[PaneSpec], args: argparse.Namespace, fps: float, device: torch.device
 ) -> list[PaneRuntime]:
@@ -1784,8 +1572,8 @@ def maybe_launch_audio(path: str) -> subprocess.Popen[bytes] | None:
     )
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
 
     for cmd in ("ffprobe", "ffmpeg", "ffplay"):
         require_cmd(cmd)

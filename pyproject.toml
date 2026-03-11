@@ -9,4 +9,8 @@ dependencies = [
     "torch>=2.9.1",
     "triton>=3.5.1",
     "numpy>=2.2.6",
+    "image>=1.5.33",
 ]
+
+[project.scripts]
+ansi-renderer-demo = "cli:main"
