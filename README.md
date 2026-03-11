@@ -133,10 +133,12 @@ uv run analyze_timing.py timing_object.csv 1
 
 ## Minimal API usage
 
+Single terminal:
+
 ```python
 import torch
-from src.ansi_renderer import AnsiRenderer
 from src.config import Config
+from src.terminal_router import render_single_terminal
 
 def frame_generator():
     while True:
@@ -144,10 +146,25 @@ def frame_generator():
         yield torch.zeros((720, 1280, 3), dtype=torch.uint8, device=torch.device("cuda"))
 
 cfg = Config(width=1280, height=720, device=torch.device("cuda"), render_mode="pixel")
-renderer = AnsiRenderer(frame_generator(), cfg)
+render_single_terminal(frame_generator(), cfg)
+```
 
-for ansi, frame_idx in renderer.get_next_ansi_sequence():
-    renderer.render_frame(ansi, frame_idx)
+Reusable multi-pane rendering from any frame source:
+
+```python
+import torch
+from src.config import Config
+from src.multi_pane import MultiPaneOptions
+from src.terminal_router import render_with_terminal_mode
+
+def frame_generator():
+    while True:
+        yield torch.zeros((720, 1280, 3), dtype=torch.uint8, device=torch.device("cuda"))
+
+cfg = Config(width=1280, height=720, device=torch.device("cuda"), render_mode="quadrant")
+options = MultiPaneOptions(launcher="./open_four_alacritty.sh", sync_mode="pane")
+
+render_with_terminal_mode(frame_generator(), cfg, terminal_mode="multi", multi_pane_options=options)
 ```
 
 ## Project layout
