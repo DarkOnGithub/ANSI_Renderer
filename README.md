@@ -19,6 +19,7 @@ Notes:
 - Yaosobi - Idol: https://youtu.be/7995X3B275g
 - 3D Cube: https://youtu.be/7Zr2gqd8iPI
 - Bad Apple: https://youtu.be/EVdXZdDUfWs
+- Multi-pane example: https://www.youtube.com/watch?v=ftHQEd0QApc
 
 ## Requirements
 
@@ -47,6 +48,23 @@ startup_mode = "Fullscreen"
 padding = { x = 0, y = 0 }
 ```
 
+For a 720p quadrant multi-pane setup aimed at higher frame rate, use a tight grid like this:
+
+```toml
+[font]
+size = 3.6
+
+[font.offset]
+x = 0
+y = -2
+
+[window]
+dimensions = { columns = 320, lines = 90 }
+decorations = "none"
+startup_mode = "Windowed"
+padding = { x = 0, y = 0 }
+```
+
 ## Installation (uv)
 
 1) Create a virtual environment with `uv` (activation is optional; `uv run` will auto-use `.venv`)
@@ -71,30 +89,43 @@ uv pip install -e .
 
 ## Run
 
-### Video demo (`example.py`)
+### Demo router
 
-Edit `video_path` in `example.py`, then run:
+Use the shared CLI to choose the demo and whether it renders in one terminal or a multi-pane launcher session:
 
 ```bash
-uv run example.py
+uv run ansi-renderer-demo video --terminal-mode single
+uv run ansi-renderer-demo video --terminal-mode multi -- path/to/video.mp4 --stats-interval 0.5
+uv run ansi-renderer-demo object --terminal-mode single
+uv run ansi-renderer-demo object --terminal-mode multi -- --width 1280 --height 720
 ```
 
-This script:
-- decodes frames with OpenCV/FFmpeg
+Arguments after `--` are forwarded to the selected demo.
+
+Multi-pane mode is useful when you want higher frame rate by splitting the output across multiple terminals.
+
+### Video demo (`video_demo.py`)
+
+```bash
+uv run video_demo.py path/to/video.mp4
+```
+
+This demo:
+- decodes frames with FFmpeg
 - plays audio with `ffplay`
-- uses `AnsiRenderer` with adaptive quality controls
+- renders into one terminal with `AnsiRenderer`
 
 ### 3D cube demo (`example/object.py`)
 
 ```bash
-uv run example/object.py
+uv run python -m example.object --terminal-mode multi
 ```
 
-This is a procedural GPU-rendered cube scene streamed to ANSI.
+This is a procedural GPU-rendered cube scene and it can now render to either a single terminal or the reusable multi-pane path.
 
 ### Timing analysis
 
-If you enable timing in config (for example in `example/object.py`), analyze the CSV with:
+If you enable timing in config, analyze the CSV with:
 
 ```bash
 uv run analyze_timing.py timing_object.csv 1
@@ -125,5 +156,6 @@ for ansi, frame_idx in renderer.get_next_ansi_sequence():
 - `src/frame_processing.py`: resize, diffing, and mode-specific preprocessing
 - `src/ansi_generator.py`: Triton kernels and ANSI sequence generation
 - `src/config.py`: runtime configuration and ANSI constants
-- `example.py`: video playback demo
+- `cli.py`: demo router for single-terminal vs multi-pane playback
+- `video_demo.py`: single-terminal video playback demo
 - `example/object.py`: procedural cube demo
