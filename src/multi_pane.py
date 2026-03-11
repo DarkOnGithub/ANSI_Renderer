@@ -2,6 +2,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +44,7 @@ class MultiPaneOptions:
     session_dir: str | None = None
     sync_mode: str = "pane"
     cell_aspect: float = CELL_ASPECT
+    stats_interval: float = 0.0
 
 
 @dataclass
@@ -84,6 +86,28 @@ class PanePayload:
 class SharedBuildRuntime:
     renderer: AnsiRenderer
     previous_frame: torch.Tensor | None = None
+
+
+@dataclass
+class MultiPaneStats:
+    window_started_at: float
+    frames_rendered: int = 0
+    build_time_sum: float = 0.0
+    flush_time_sum: float = 0.0
+    payload_bytes_sum: int = 0
+
+    def record(self, build_time: float, flush_time: float, payload_bytes: int) -> None:
+        self.frames_rendered += 1
+        self.build_time_sum += build_time
+        self.flush_time_sum += flush_time
+        self.payload_bytes_sum += int(payload_bytes)
+
+    def reset_window(self, now: float) -> None:
+        self.window_started_at = now
+        self.frames_rendered = 0
+        self.build_time_sum = 0.0
+        self.flush_time_sum = 0.0
+        self.payload_bytes_sum = 0
 
 
 def resolve_path(path: str) -> str:
@@ -499,6 +523,40 @@ def _new_gpu_segment() -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
     return torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
 
 
+def payload_bytes(payloads: list[PanePayload]) -> int:
+    return sum(
+        0 if payload.payload_view is None else int(payload.payload_view.nbytes)
+        for payload in payloads
+    )
+
+
+def maybe_emit_runtime_stats(
+    stats: MultiPaneStats,
+    interval: float,
+    now: float,
+) -> None:
+    if interval <= 0.0 or now - stats.window_started_at < interval:
+        return
+
+    elapsed = max(now - stats.window_started_at, 1e-6)
+    frames = max(stats.frames_rendered, 1)
+    shown_fps = stats.frames_rendered / elapsed
+    avg_build_ms = 1000.0 * stats.build_time_sum / frames
+    avg_flush_ms = 1000.0 * stats.flush_time_sum / frames
+    avg_bytes = stats.payload_bytes_sum / frames
+    print(
+        (
+            f"multi-pane stats fps={shown_fps:.1f} "
+            f"avg_build_ms={avg_build_ms:.1f} "
+            f"avg_flush_ms={avg_flush_ms:.1f} "
+            f"avg_bytes={int(avg_bytes)}"
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+    stats.reset_window(now)
+
+
 def tensor_payload_view(
     pane: PaneRuntime,
     payload: torch.Tensor,
@@ -760,12 +818,14 @@ class MultiPaneRenderer:
         self.shared_runtime = SharedBuildRuntime(
             renderer=build_renderer(self.config, self.total_width, self.total_height)
         )
+        self.stats = MultiPaneStats(window_started_at=time.perf_counter())
         self.closed = False
 
         for pane in self.panes:
             write_all(pane.fd, INIT_SEQUENCE)
 
     def render_frame(self, frame: torch.Tensor) -> None:
+        build_start = time.perf_counter()
         if isinstance(frame, torch.Tensor):
             frame = frame.to(device=self.config.device, dtype=torch.uint8)
         else:
@@ -782,8 +842,18 @@ class MultiPaneRenderer:
             canvas,
             self.config,
         )
+        build_time = time.perf_counter() - build_start
+
+        flush_start = time.perf_counter()
         flush_pane_payloads(self.panes, payloads, self.options.sync_mode)
+        flush_time = time.perf_counter() - flush_start
         self.shared_runtime.previous_frame = next_previous_frame
+        self.stats.record(build_time, flush_time, payload_bytes(payloads))
+        maybe_emit_runtime_stats(
+            self.stats,
+            float(self.options.stats_interval),
+            time.perf_counter(),
+        )
 
     def render_frames(self, frames: Iterable[torch.Tensor]) -> None:
         for frame in frames:
