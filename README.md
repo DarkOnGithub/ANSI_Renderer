@@ -162,10 +162,16 @@ def frame_generator():
         yield torch.zeros((720, 1280, 3), dtype=torch.uint8, device=torch.device("cuda"))
 
 cfg = Config(width=1280, height=720, device=torch.device("cuda"), render_mode="quadrant")
-options = MultiPaneOptions(launcher="./open_four_alacritty.sh", sync_mode="pane")
+options = MultiPaneOptions(
+    launcher="./open_four_alacritty.sh",
+    sync_mode="pane",
+    stats_interval=0.5,
+)
 
 render_with_terminal_mode(frame_generator(), cfg, terminal_mode="multi", multi_pane_options=options)
 ```
+
+Set `stats_interval` to print reusable multi-pane runtime stats to stderr every N seconds. Use `0` to disable them.
 
 ## Project layout
 
